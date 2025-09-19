@@ -542,10 +542,14 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
     
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_ONE_PATTERN), plus_one_message))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_ONE_PATTERN), minus_one_message))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
+   # +1 / -1
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_ONE_PATTERN), plus_one_message))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_ONE_PATTERN), minus_one_message))
+
+# + / -
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
+app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
+
     app.add_handler(ChatMemberHandler(handle_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     print("Bot is running. Press Ctrl+C to stop.")
