@@ -20,6 +20,7 @@ WEEKDAY_RU = ["Понедельник", "Вторник", "Среда", "Чет�
               "Пятница", "Суббота", "Воскресенье"]
 
 PLUS_PATTERN = re.compile(r"^\s*(\+|➕)\s*$")  
+MINUS_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*$")
 
 # ---------- Simple storage ----------
 # state per chat_id:
@@ -305,6 +306,41 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state["users"].append(name)
     save_state()
     await update.message.reply_text("Записал! ✅\n\n" + format_list(chat_state))
+
+async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Разрешаем удалять себя даже если набор закрыт
+    if update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    ensure_chat(update.effective_chat.id)
+    chat_state = state[str(update.effective_chat.id)]
+    users = chat_state.get("users", [])
+
+    # Определяем «себя» по формату, который мы сохраняем в списке
+    name = display_name_from_update(update).lower()
+    uname = ("@" + update.effective_user.username).lower() if (update.effective_user and update.effective_user.username) else None
+
+    new_users = []
+    removed = 0
+    for entry in users:
+        el = entry.lower()
+        if el == name:
+            removed += 1
+            continue
+        if uname and uname in el:
+            removed += 1
+            continue
+        new_users.append(entry)
+
+    chat_state["users"] = new_users
+    save_state()
+
+    if removed:
+        await update.message.reply_text("Ок, убрал тебя из списка 👌\n\n" + format_list(chat_state))
+    else:
+        await update.message.reply_text("Тебя нет в списке — ничего не удалял.")
 
 async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
