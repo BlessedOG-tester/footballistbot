@@ -91,16 +91,20 @@ def format_list(chat_state: Dict[str, Any]) -> str:
     header = format_header(chat_state)
     users = chat_state.get("users", [])
     limit = chat_state.get("limit", 0)
-    count = _total_count(users)
 
-    if users:
-        body = "\n".join([f"{i+1}. {u}" for i, u in enumerate(users)])
+    # ↓ добавлено
+    expanded = _expanded_users(users)
+    count = len(expanded)
+
+    if expanded:
+        body = "\n".join(f"{i+1}. {u}" for i, u in enumerate(expanded))
     else:
         body = "Пока пусто. Пиши '+' чтобы записаться."
 
     cap = f"\n\n⚠️ Достигнут лимит ({limit})." if limit and count >= limit else ""
     status = "Открыто ✅" if chat_state.get("open") else "Закрыто ⛔️"
-    return f"{header}\n\nСтатус: {status}\nУчастников: {count}" + cap + f"\n\n{body}"
+    return f"{header}\n\nСтатус: {status}\nУчастников: {count}{cap}\n\n{body}"
+
 
 def display_name_from_update(update: Update) -> str:
     u = update.effective_user
@@ -148,6 +152,19 @@ def _total_count(users) -> int:
         if e.endswith(" +1"):
             c += 1
     return c
+    
+def _expanded_users(users):
+    """Возвращает список строк для отображения: если у записи есть +1,
+    выводим две строки — базовую и ту же с суффиксом ' +1'."""
+    out = []
+    for e in users:
+        if e.endswith(" +1"):
+            base = e[:-3].strip()
+            out.append(base)  # основная строка
+            out.append(e)     # гость как отдельная строка
+        else:
+            out.append(e)
+    return out
 
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,6 +359,7 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.append(disp)
     save_state()
     await update.message.reply_text("Записал! ✅\n\n" + format_list(chat_state))
+    
 async def plus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None or update.message is None:
         return
