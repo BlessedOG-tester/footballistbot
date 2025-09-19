@@ -21,6 +21,8 @@ WEEKDAY_RU = ["Понедельник", "Вторник", "Среда", "Чет�
 
 PLUS_PATTERN = re.compile(r"^\s*(\+|➕)\s*$")  
 MINUS_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*$")
+PLUS_ONE_PATTERN = re.compile(r"^\s*(\+|➕)\s*1\s*$")
+MINUS_ONE_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*1\s*$")
 
 # ---------- Simple storage ----------
 # state per chat_id:
@@ -89,7 +91,7 @@ def format_list(chat_state: Dict[str, Any]) -> str:
     header = format_header(chat_state)
     users = chat_state.get("users", [])
     limit = chat_state.get("limit", 0)
-    count = len(users)
+    count = _total_count(users)
 
     if users:
         body = "\n".join([f"{i+1}. {u}" for i, u in enumerate(users)])
@@ -122,6 +124,30 @@ def parse_time(s: str) -> str:
     if re.match(r"^\\d{2}:\\d{2}-\\d{2}:\\d{2}$", s):
         return s
     raise ValueError("Неверный формат времени. Пример: 20:00-22:00")
+
+def _normalize_entry(entry: str) -> str:
+    # "Имя (@user) +1" -> "Имя (@user)"
+    return entry[:-3].strip() if entry.endswith(" +1") else entry.strip()
+
+def _find_user_index(users, display_name: str, username: str | None):
+    dn = display_name.lower().strip()
+    un = ("@" + username.lower()) if username else None
+    for i, e in enumerate(users):
+        el = e.lower()
+        if un and un in el:
+            return i
+        if _normalize_entry(el) == dn:
+            return i
+    return -1
+
+def _total_count(users) -> int:
+    # Считает людей с учётом +1
+    c = 0
+    for e in users:
+        c += 1
+        if e.endswith(" +1"):
+            c += 1
+    return c
 
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,25 +314,77 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
+
     ensure_chat(update.effective_chat.id)
     chat_state = state[str(update.effective_chat.id)]
     if not chat_state.get("open", False):
+        await update.message.reply_text("Запись закрыта ⛔️. Админам: /open")
         return
 
+    users = chat_state["users"]
     limit = chat_state.get("limit", 0)
-    if limit and len(chat_state["users"]) >= limit:
-        await update.message.reply_text("⚠️ Лимит достигнут. Свободных мест нет.")
-        return
+    cur = _total_count(users)
 
-    name = display_name_from_update(update)
-    if any(name.lower() == u.lower() for u in chat_state["users"]):
+    disp = display_name_from_update(update)
+    uname = update.effective_user.username if update.effective_user else None
+
+    # уже в списке?
+    idx = _find_user_index(users, disp, uname)
+    if idx != -1:
         await update.message.reply_text("Ты уже в списке ✅")
         return
 
-    chat_state["users"].append(name)
+    # проверка лимита (+1 человек)
+    if limit and cur + 1 > limit:
+        await update.message.reply_text(f"⚠️ Нет свободных мест (лимит {limit}).")
+        return
+
+    users.append(disp)
     save_state()
     await update.message.reply_text("Записал! ✅\n\n" + format_list(chat_state))
+async def plus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
 
+    ensure_chat(update.effective_chat.id)
+    chat_state = state[str(update.effective_chat.id)]
+    if not chat_state.get("open", False):
+        await update.message.reply_text("Запись закрыта ⛔️. Админам: /open")
+        return
+
+    users = chat_state["users"]
+    limit = chat_state.get("limit", 0)
+    cur = _total_count(users)
+
+    disp = display_name_from_update(update)
+    uname = update.effective_user.username if update.effective_user else None
+    idx = _find_user_index(users, disp, uname)
+
+    if idx == -1:
+        # нет в списке → сразу "Имя ... +1" (занимает 2 места)
+        if limit and cur + 2 > limit:
+            await update.message.reply_text(f"⚠️ Не хватает мест для +1 (лимит {limit}).")
+            return
+        users.append(f"{disp} +1")
+        save_state()
+        await update.message.reply_text("Записал тебя с другом 👥✅\n\n" + format_list(chat_state))
+        return
+
+    # уже есть — добавим +1 (занимает +1 место)
+    if users[idx].endswith(" +1"):
+        await update.message.reply_text("У тебя уже стоит +1 👌")
+        return
+
+    if limit and cur + 1 > limit:
+        await update.message.reply_text(f"⚠️ Не хватает мест для +1 (лимит {limit}).")
+        return
+
+    users[idx] = users[idx] + " +1"
+    save_state()
+    await update.message.reply_text("Добавил +1 👥✅\n\n" + format_list(chat_state))
+        
 async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Разрешаем удалять себя даже если набор закрыт
     if update.effective_chat is None or update.message is None:
@@ -342,6 +420,31 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Тебя нет в списке — ничего не удалял.")
 
+async def minus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or update.message is None:
+        return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    ensure_chat(update.effective_chat.id)
+    chat_state = state[str(update.effective_chat.id)]
+    users = chat_state["users"]
+
+    disp = display_name_from_update(update)
+    uname = update.effective_user.username if update.effective_user else None
+    idx = _find_user_index(users, disp, uname)
+
+    if idx == -1:
+        await update.message.reply_text("Тебя нет в списке — нечего менять.")
+        return
+
+    if users[idx].endswith(" +1"):
+        users[idx] = _normalize_entry(users[idx])
+        save_state()
+        await update.message.reply_text("Убрал твой +1 👌\n\n" + format_list(chat_state))
+    else:
+        await update.message.reply_text("У тебя не было +1.")
+
 async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
@@ -364,7 +467,9 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
-
+    
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_ONE_PATTERN), plus_one_message))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_ONE_PATTERN), minus_one_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
     app.add_handler(ChatMemberHandler(handle_member_update, ChatMemberHandler.CHAT_MEMBER))
