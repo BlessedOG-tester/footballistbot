@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import asyncio
 from datetime import datetime
 from typing import Dict, Any
 
@@ -310,13 +309,13 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
-async def main():
+def main():
     load_state()
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
 
-    app: Application = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -334,7 +333,8 @@ async def main():
     app.add_handler(ChatMemberHandler(handle_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     print("Bot is running. Press Ctrl+C to stop.")
-    await app.run_polling(close_loop=False)
+    # ВАЖНО: без await/asyncio
+    app.run_polling()
 
 if __name__ == "__main__":
     try:
@@ -342,4 +342,4 @@ if __name__ == "__main__":
         dotenv.load_dotenv()
     except Exception:
         pass
-    asyncio.run(main())
+    main()
