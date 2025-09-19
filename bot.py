@@ -19,7 +19,7 @@ STATE_FILE = "state.json"
 WEEKDAY_RU = ["Понедельник", "Вторник", "Среда", "Четверг",
               "Пятница", "Суббота", "Воскресенье"]
 
-PLUS_PATTERN = re.compile(r"^\\s*\\+\\s*$")   # strict '+' message
+PLUS_PATTERN = re.compile(r"^\s*(\+|➕)\s*$")  
 
 # ---------- Simple storage ----------
 # state per chat_id:
@@ -91,13 +91,13 @@ def format_list(chat_state: Dict[str, Any]) -> str:
     count = len(users)
 
     if users:
-        body = "\\n".join([f"{i+1}. {u}" for i, u in enumerate(users)])
+        body = "\n".join([f"{i+1}. {u}" for i, u in enumerate(users)])
     else:
         body = "Пока пусто. Пиши '+' чтобы записаться."
 
-    cap = f"\\n\\n⚠️ Достигнут лимит ({limit})." if limit and count >= limit else ""
+    cap = f"\n\n⚠️ Достигнут лимит ({limit})." if limit and count >= limit else ""
     status = "Открыто ✅" if chat_state.get("open") else "Закрыто ⛔️"
-    return f"{header}\\n\\nСтатус: {status}\\nУчастников: {count}" + cap + f"\\n\\n{body}"
+    return f"{header}\n\nСтатус: {status}\nУчастников: {count}" + cap + f"\n\n{body}"
 
 def display_name_from_update(update: Update) -> str:
     u = update.effective_user
@@ -128,18 +128,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ensure_chat(update.effective_chat.id)
     await update.message.reply_text(
-        "Привет! Я веду список на футбол.\\n"
-        "Участникам: просто напишите '+'\\n\\n"
-        "Админам:\\n"
-        "/open [ДД/ММ/ГГ] [ЧЧ:ММ-ЧЧ:ММ]\\n"
-        "/setdate ДД/ММ/ГГ\\n"
-        "/settime ЧЧ:ММ-ЧЧ:ММ\\n"
-        "/setfield ТЕКСТ\\n"
-        "/setlimit N\\n"
-        "/remove @username|Имя\\n"
-        "/list\\n"
-        "/reset\\n"
-        "/close\\n"
+        "Привет! Я веду список на футбол.\n"
+        "Участникам: просто напишите '+'\n\n"
+        "Админам:\n"
+        "/open [ДД/ММ/ГГ] [ЧЧ:ММ-ЧЧ:ММ]\n"
+        "/setdate ДД/ММ/ГГ\n"
+        "/settime ЧЧ:ММ-ЧЧ:ММ\n"
+        "/setfield ТЕКСТ\n"
+        "/setlimit N\n"
+        "/remove @username|Имя\n"
+        "/list\n"
+        "/reset\n"
+        "/close\n"
         "/help"
     )
 
@@ -162,7 +162,7 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_state["time"] = parse_time(args[1])
         chat_state["open"] = True
         save_state()
-        await update.message.reply_text("Запись открыта ✅\\n\\n" + format_list(chat_state))
+        await update.message.reply_text("Запись открыта ✅\n\n" + format_list(chat_state))
     except ValueError as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
@@ -179,7 +179,7 @@ async def setdate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_state["date"] = parse_date(context.args[0])
         save_state()
-        await update.message.reply_text("Дата обновлена ✅\\n\\n" + format_list(chat_state))
+        await update.message.reply_text("Дата обновлена ✅\n\n" + format_list(chat_state))
     except ValueError as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
@@ -196,7 +196,7 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_state["time"] = parse_time(context.args[0])
         save_state()
-        await update.message.reply_text("Время обновлено ✅\\n\\n" + format_list(chat_state))
+        await update.message.reply_text("Время обновлено ✅\n\n" + format_list(chat_state))
     except ValueError as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
@@ -213,7 +213,7 @@ async def setfield_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_state["field"] = text
     save_state()
-    await update.message.reply_text("Поле обновлено ✅\\n\\n" + format_list(chat_state))
+    await update.message.reply_text("Поле обновлено ✅\n\n" + format_list(chat_state))
 
 async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None:
@@ -229,7 +229,7 @@ async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lim = int(context.args[0])
         chat_state["limit"] = max(0, lim)
         save_state()
-        await update.message.reply_text("Лимит обновлён ✅\\n\\n" + format_list(chat_state))
+        await update.message.reply_text("Лимит обновлён ✅\n\n" + format_list(chat_state))
     except Exception:
         await update.message.reply_text("Неверное значение. Пример: /setlimit 28")
 
@@ -250,7 +250,7 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state["users"] = users
     save_state()
     removed = before - len(users)
-    await update.message.reply_text(f"Убрано: {removed}\\n\\n" + format_list(chat_state))
+    await update.message.reply_text(f"Убрано: {removed}\n\n" + format_list(chat_state))
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None:
@@ -268,7 +268,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = state[str(update.effective_chat.id)]
     chat_state["users"] = []
     save_state()
-    await update.message.reply_text("Список очищен 🧹\\n\\n" + format_list(chat_state))
+    await update.message.reply_text("Список очищен 🧹\n\n" + format_list(chat_state))
 
 async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None:
@@ -279,7 +279,7 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = state[str(update.effective_chat.id)]
     chat_state["open"] = False
     save_state()
-    await update.message.reply_text("Запись закрыта ⛔️\\n\\n" + format_list(chat_state))
+    await update.message.reply_text("Запись закрыта ⛔️\n\n" + format_list(chat_state))
 
 # '+' handler
 async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,7 +304,7 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_state["users"].append(name)
     save_state()
-    await update.message.reply_text("Записал! ✅\\n\\n" + format_list(chat_state))
+    await update.message.reply_text("Записал! ✅\n\n" + format_list(chat_state))
 
 async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
