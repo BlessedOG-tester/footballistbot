@@ -14,19 +14,23 @@ from telegram.ext import (
 # ---------- Defaults ----------
 DEFAULT_FIELD = "Горизонт-арена"
 DEFAULT_TIME = "20:00-22:00"
-STATE_FILE = "state.json"
+STATE_FILE = "state.json"  # при желании: os.getenv("STATE_FILE", "/data/state.json")
 
 WEEKDAY_RU = ["Понедельник", "Вторник", "Среда", "Четверг",
               "Пятница", "Суббота", "Воскресенье"]
 
-# Паттерны
+# Ограничение на гостей от одного человека
+MAX_GUESTS_PER_HOST = 5
+ZWS = "\u200b"  # zero-width space
+
+# ---------- Patterns ----------
 PLUS_PATTERN = re.compile(r"^\s*(\+|➕)\s*$")
 MINUS_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*$")
 PLUS_ONE_PATTERN = re.compile(r"^\s*(\+|➕)\s*1\s*$")
 MINUS_ONE_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*1\s*$")
-
-# Невидимый суффикс: "гость без хозяина"
-GUEST_ONLY_SUFFIX = " +1\u200b"  # \u200b = zero-width space
+# +N / -N (N = 2..5)
+PLUS_N_PATTERN = re.compile(r"^\s*(\+|➕)\s*([2-5])\s*$")
+MINUS_N_PATTERN = re.compile(r"^\s*(-|—|–|➖)\s*([2-5])\s*$")
 
 # ---------- Simple storage ----------
 state: Dict[str, Dict[str, Any]] = {}
@@ -67,6 +71,67 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     except Exception:
         return False
 
+# ---------- Helpers: guests parsing ----------
+# запись хранится как:
+# "Имя"                  -> хозяин без гостей
+# "Имя +N"               -> хозяин с N гостями
+# "Имя +N{ZWS}"          -> только гости (хозяина нет), N гостей
+
+_guest_re = re.compile(r"\s\+(\d+)(\u200b)?$")
+
+def _guest_count(entry: str) -> int:
+    m = _guest_re.search(entry)
+    return int(m.group(1)) if m else 0
+
+def _is_guest_only(entry: str) -> bool:
+    m = _guest_re.search(entry)
+    return bool(m and m.group(2))
+
+def _strip_guest(entry: str) -> str:
+    return _guest_re.sub("", entry).strip()
+
+def _make_entry(display: str, n: int, guest_only: bool) -> str:
+    display = display.strip()
+    if n <= 0:
+        return display
+    return f"{display} +{n}{ZWS if guest_only else ''}"
+
+def _find_user_index(users, display_name: str, username: str | None) -> int:
+    dn = display_name.lower().strip()
+    un = ("@" + username.lower()) if username else None
+    for i, e in enumerate(users):
+        el = e.lower()
+        if un and un in el:
+            return i
+        if _strip_guest(el) == dn:
+            return i
+    return -1
+
+def _total_count(users) -> int:
+    # owner+guests -> 1+N; guest-only -> N; solo -> 1
+    c = 0
+    for e in users:
+        n = _guest_count(e)
+        if n:
+            c += n if _is_guest_only(e) else (1 + n)
+        else:
+            c += 1
+    return c
+
+def _expanded_users(users):
+    """Для отображения: хозяина и каждого гостя выводим отдельной строкой."""
+    out = []
+    for e in users:
+        n = _guest_count(e)
+        base = _strip_guest(e)
+        if n:
+            if not _is_guest_only(e):
+                out.append(base)  # хозяин
+            out.extend([f"{base} +1"] * n)  # n строк гостей
+        else:
+            out.append(base)
+    return out
+
 def format_header(chat_state: Dict[str, Any]) -> str:
     try:
         d = datetime.strptime(chat_state["date"], "%d/%m/%y")
@@ -78,6 +143,21 @@ def format_header(chat_state: Dict[str, Any]) -> str:
         f"🏟️ Поле: {chat_state.get('field', DEFAULT_FIELD)}\n"
         f"⏰ Время: {chat_state.get('time', DEFAULT_TIME)}"
     )
+
+def format_list(chat_state: Dict[str, Any]) -> str:
+    header = format_header(chat_state)
+    users = chat_state.get("users", [])
+    limit = chat_state.get("limit", 0)
+
+    expanded = _expanded_users(users)
+    count = len(expanded)
+
+    body = "\n".join(f"{i+1}. {u}" for i, u in enumerate(expanded)) if expanded \
+        else "Пока пусто. Пиши '+' чтобы записаться."
+
+    cap = f"\n\n⚠️ Достигнут лимит ({limit})." if limit and count >= limit else ""
+    status = "Открыто ✅" if chat_state.get("open") else "Закрыто ⛔️"
+    return f"{header}\n\nСтатус: {status}\nУчастников: {count}{cap}\n\n{body}"
 
 def display_name_from_update(update: Update) -> str:
     u = update.effective_user
@@ -98,67 +178,6 @@ def parse_time(s: str) -> str:
         return s
     raise ValueError("Неверный формат времени. Пример: 20:00-22:00")
 
-# ---------- Helpers ----------
-def _strip_guest_suffix(entry: str) -> str:
-    if entry.endswith(" +1"):
-        return entry[:-3].strip()
-    if entry.endswith(GUEST_ONLY_SUFFIX):
-        return entry[:-(len(GUEST_ONLY_SUFFIX))].strip()
-    return entry.strip()
-
-def _is_guest_only(entry: str) -> bool:
-    return entry.endswith(GUEST_ONLY_SUFFIX)
-
-def _find_user_index(users, display_name: str, username: str | None) -> int:
-    dn = display_name.lower().strip()
-    un = ("@" + username.lower()) if username else None
-    for i, e in enumerate(users):
-        el = e.lower()
-        if un and un in el:
-            return i
-        if _strip_guest_suffix(el) == dn:
-            return i
-    return -1
-
-def _total_count(users) -> int:
-    c = 0
-    for e in users:
-        if e.endswith(" +1"):
-            c += 2
-        else:
-            c += 1  # обычный или guest-only
-    return c
-
-def _expanded_users(users):
-    """Для отображения: пары -> две строки, guest-only -> одна строка с '+1'."""
-    out = []
-    for e in users:
-        if e.endswith(" +1"):
-            base = e[:-3].strip()
-            out.append(base)
-            out.append(base + " +1")
-        elif e.endswith(GUEST_ONLY_SUFFIX):
-            base = e[:-(len(GUEST_ONLY_SUFFIX))].strip()
-            out.append(base + " +1")  # только гость
-        else:
-            out.append(e)
-    return out
-
-def format_list(chat_state: Dict[str, Any]) -> str:
-    header = format_header(chat_state)
-    users = chat_state.get("users", [])
-    limit = chat_state.get("limit", 0)
-
-    expanded = _expanded_users(users)
-    count = len(expanded)
-
-    body = "\n".join(f"{i+1}. {u}" for i, u in enumerate(expanded)) if expanded \
-        else "Пока пусто. Пиши '+' чтобы записаться."
-
-    cap = f"\n\n⚠️ Достигнут лимит ({limit})." if limit and count >= limit else ""
-    status = "Открыто ✅" if chat_state.get("open") else "Закрыто ⛔️"
-    return f"{header}\n\nСтатус: {status}\nУчастников: {count}{cap}\n\n{body}"
-
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None:
@@ -166,7 +185,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Я веду список на футбол.\n"
-        "Участникам: '+' (записаться), '-1' (убрать гостя), '-' (убрать себя), '+1' (добавить гостя)\n\n"
+        "Участникам: '+', '-'; '+1'/'-1'; '+N'/'-N' (N=2..5).\n\n"
         "Админам:\n"
         "/open [ДД/ММ/ГГ] [ЧЧ:ММ-ЧЧ:ММ]\n"
         "/setdate ДД/ММ/ГГ\n"
@@ -184,9 +203,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat is None:
-        return
-    if not await is_admin(update, context):
+    if update.effective_chat is None or not await is_admin(update, context):
         return
     ensure_chat(update.effective_chat.id)
     chat_state = state[str(update.effective_chat.id)]
@@ -299,11 +316,11 @@ async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Message Handlers ----------
 async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'+': добавить хозяина (если был guest-only, вернуть хозяина)."""
     if update.effective_chat is None or update.message is None:
         return
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-
     ensure_chat(update.effective_chat.id)
     chat_state = state[str(update.effective_chat.id)]
     if not chat_state.get("open", False):
@@ -313,7 +330,6 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = chat_state["users"]
     limit = chat_state.get("limit", 0)
     cur = _total_count(users)
-
     disp = display_name_from_update(update)
     uname = update.effective_user.username if update.effective_user else None
     idx = _find_user_index(users, disp, uname)
@@ -321,12 +337,14 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if idx != -1:
         entry = users[idx]
         if _is_guest_only(entry):
+            # вернуть хозяина, гостей не меняем
             if limit and cur + 1 > limit:
                 await update.message.reply_text(f"⚠️ Нет свободных мест (лимит {limit}).")
                 return
-            users[idx] = _strip_guest_suffix(entry) + " +1"
+            n = _guest_count(entry)
+            users[idx] = _make_entry(_strip_guest(entry), n, guest_only=False)
             save_state()
-            await update.message.reply_text("Вернул тебя, гость остаётся 👥✅\n\n" + format_list(chat_state))
+            await update.message.reply_text("Вернул тебя, гость(и) остаются 👥✅\n\n" + format_list(chat_state))
             return
         else:
             await update.message.reply_text("Ты уже в списке ✅")
@@ -335,18 +353,17 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if limit and cur + 1 > limit:
         await update.message.reply_text(f"⚠️ Нет свободных мест (лимит {limit}).")
         return
-    users.append(disp)
+    users.append(_make_entry(disp, 0, False))
     save_state()
     await update.message.reply_text("Записал! ✅\n\n" + format_list(chat_state))
 
-async def plus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat is None or update.message is None:
+async def _plus_n_common(update: Update, n: int):
+    """Общая логика для '+N' (включая '+1')."""
+    chat = update.effective_chat
+    if chat is None or update.message is None:
         return
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-
-    ensure_chat(update.effective_chat.id)
-    chat_state = state[str(update.effective_chat.id)]
+    ensure_chat(chat.id)
+    chat_state = state[str(chat.id)]
     if not chat_state.get("open", False):
         await update.message.reply_text("Запись закрыта ⛔️. Админам: /open")
         return
@@ -354,39 +371,60 @@ async def plus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = chat_state["users"]
     limit = chat_state.get("limit", 0)
     cur = _total_count(users)
-
     disp = display_name_from_update(update)
     uname = update.effective_user.username if update.effective_user else None
     idx = _find_user_index(users, disp, uname)
 
     if idx == -1:
-        if limit and cur + 2 > limit:
-            await update.message.reply_text(f"⚠️ Не хватает мест для +1 (лимит {limit}).")
+        # нет в списке → хозяин + N гостей
+        if n > MAX_GUESTS_PER_HOST:
+            await update.message.reply_text(f"Максимум +{MAX_GUESTS_PER_HOST}.")
             return
-        users.append(f"{disp} +1")
+        if limit and cur + (1 + n) > limit:
+            await update.message.reply_text(f"⚠️ Не хватает мест для +{n} (лимит {limit}).")
+            return
+        users.append(_make_entry(disp, n, False))
         save_state()
-        await update.message.reply_text("Записал тебя с другом 👥✅\n\n" + format_list(chat_state))
+        await update.message.reply_text(f"Записал тебя с +{n} 👥✅\n\n" + format_list(chat_state))
         return
 
     entry = users[idx]
-    if entry.endswith(" +1") or _is_guest_only(entry):
-        await update.message.reply_text("У тебя уже стоит +1 👌")
+    base = _strip_guest(entry)
+    cur_n = _guest_count(entry)
+    is_guest_only = _is_guest_only(entry)
+
+    # сколько доп. мест потребуется (для проверки лимита)
+    extra_slots = n + (1 if is_guest_only else 0)
+
+    if cur_n + n > MAX_GUESTS_PER_HOST:
+        await update.message.reply_text(f"Слишком много гостей. У тебя уже +{cur_n}. Максимум +{MAX_GUESTS_PER_HOST}.")
         return
 
-    if limit and cur + 1 > limit:
-        await update.message.reply_text(f"⚠️ Не хватает мест для +1 (лимит {limit}).")
+    if limit and cur + extra_slots > limit:
+        await update.message.reply_text(f"⚠️ Не хватает мест для +{n} (лимит {limit}).")
         return
 
-    users[idx] = users[idx] + " +1"
+    new_n = cur_n + n
+    users[idx] = _make_entry(base, new_n, False)  # хозяин точно будет после '+N'
     save_state()
-    await update.message.reply_text("Добавил +1 👥✅\n\n" + format_list(chat_state))
+    await update.message.reply_text(f"Добавил +{n} 👥✅\n\n" + format_list(chat_state))
+
+async def plus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _plus_n_common(update, 1)
+
+async def plus_n_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # вытащим N из текста
+    m = PLUS_N_PATTERN.match(update.message.text or "")
+    n = int(m.group(2)) if m else 0
+    if n:
+        await _plus_n_common(update, n)
 
 async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'-': убрать хозяина. Если были гости — останутся как guest-only."""
     if update.effective_chat is None or update.message is None:
         return
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-
     ensure_chat(update.effective_chat.id)
     chat_state = state[str(update.effective_chat.id)]
     users = chat_state["users"]
@@ -394,55 +432,76 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     disp = display_name_from_update(update)
     uname = update.effective_user.username if update.effective_user else None
     idx = _find_user_index(users, disp, uname)
-
     if idx == -1:
         await update.message.reply_text("Тебя нет в списке — ничего не удалял.")
         return
 
     entry = users[idx]
-    if entry.endswith(" +1"):
-        users[idx] = _strip_guest_suffix(entry) + GUEST_ONLY_SUFFIX
+    n = _guest_count(entry)
+    if n > 0 and not _is_guest_only(entry):
+        users[idx] = _make_entry(_strip_guest(entry), n, True)  # остаются только гости
         save_state()
-        await update.message.reply_text("Убрал тебя, гость остаётся 👤➡️👥\n\n" + format_list(chat_state))
+        await update.message.reply_text("Убрал тебя, гости остаются 👤➡️👥\n\n" + format_list(chat_state))
         return
 
     if _is_guest_only(entry):
-        await update.message.reply_text("У тебя уже остался только +1. Чтобы убрать гостя — отправь -1.")
+        await update.message.reply_text("У тебя уже остались только гости. Чтобы убрать их — используй -1 или -N.")
         return
 
+    # обычная запись без гостей — удаляем
     del users[idx]
     save_state()
     await update.message.reply_text("Убрал тебя из списка 👌\n\n" + format_list(chat_state))
 
-async def minus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat is None or update.message is None:
+async def _minus_n_common(update: Update, n: int):
+    """Общая логика для '-N' (включая '-1'): убавить гостей."""
+    chat = update.effective_chat
+    if chat is None or update.message is None:
         return
-    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
-
-    ensure_chat(update.effective_chat.id)
-    chat_state = state[str(update.effective_chat.id)]
+    ensure_chat(chat.id)
+    chat_state = state[str(chat.id)]
     users = chat_state["users"]
 
     disp = display_name_from_update(update)
     uname = update.effective_user.username if update.effective_user else None
     idx = _find_user_index(users, disp, uname)
-
     if idx == -1:
         await update.message.reply_text("Тебя нет в списке — нечего менять.")
         return
 
     entry = users[idx]
-    if entry.endswith(" +1"):
-        users[idx] = _strip_guest_suffix(entry)  # остаётся только хозяин
+    base = _strip_guest(entry)
+    cur_n = _guest_count(entry)
+    is_guest_only = _is_guest_only(entry)
+
+    if cur_n == 0:
+        await update.message.reply_text("У тебя нет гостей.")
+        return
+
+    if n >= cur_n:
+        # снимаем всех гостей
+        if is_guest_only:
+            del users[idx]  # был только гость -> никого не осталось
+        else:
+            users[idx] = base  # остаётся только хозяин
         save_state()
-        await update.message.reply_text("Убрал твоего +1 👌\n\n" + format_list(chat_state))
-    elif _is_guest_only(entry):
-        del users[idx]  # был только гость — теперь никто
-        save_state()
-        await update.message.reply_text("Убрал твоего +1 👌\n\n" + format_list(chat_state))
-    else:
-        await update.message.reply_text("У тебя не было +1.")
+        await update.message.reply_text("Убрал твоих гостей 👌\n\n" + format_list(chat_state))
+        return
+
+    # иначе уменьшаем счётчик
+    new_n = cur_n - n
+    users[idx] = _make_entry(base, new_n, is_guest_only)
+    save_state()
+    await update.message.reply_text(f"Убрал {n} гостя(ей) 👌\n\n" + format_list(chat_state))
+
+async def minus_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _minus_n_common(update, 1)
+
+async def minus_n_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = MINUS_N_PATTERN.match(update.message.text or "")
+    n = int(m.group(2)) if m else 0
+    if n:
+        await _minus_n_common(update, n)
 
 async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
@@ -468,7 +527,9 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
 
-    # Сначала +1 / -1, потом обычные + / -
+    # Порядок важен: сначала числовые, потом единичные, потом просто +/-
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_N_PATTERN), plus_n_message))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_N_PATTERN), minus_n_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_ONE_PATTERN), plus_one_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_ONE_PATTERN), minus_one_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
