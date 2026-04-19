@@ -744,21 +744,12 @@ async def notify_promotions(
 
 
 def build_reply_keyboard(chat_state: Dict[str, Any], admin: bool) -> ReplyKeyboardMarkup:
-    rows: List[List[str]] = [
-        [BUTTON_PLUS, "+1", "+2"],
-        ["+3", "+4", "+5"],
-        [BUTTON_MINUS, BUTTON_LIST],
-        [BUTTON_MENU],
-    ]
+    rows: List[List[str]] = [[BUTTON_LIST, BUTTON_MENU]]
 
     if admin:
         rows.append([BUTTON_OPEN, BUTTON_CLOSE])
-        rows.append([BUTTON_TODAY, BUTTON_TOMORROW])
         rows.append([BUTTON_SET_DATETIME, BUTTON_SET_FIELD])
         rows.append([BUTTON_SET_SCHEDULE, BUTTON_SHOW_SCHEDULE])
-        field_buttons = chat_state.get("field_options", [])[:3]
-        if field_buttons:
-            rows.append(field_buttons)
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -843,8 +834,6 @@ def is_service_button_text(text: str, chat_state: Dict[str, Any]) -> bool:
         BUTTON_MENU,
         BUTTON_OPEN,
         BUTTON_CLOSE,
-        BUTTON_TODAY,
-        BUTTON_TOMORROW,
         BUTTON_SET_DATETIME,
         BUTTON_SET_FIELD,
         BUTTON_SET_SCHEDULE,
@@ -855,7 +844,6 @@ def is_service_button_text(text: str, chat_state: Dict[str, Any]) -> bool:
         "+4",
         "+5",
     }
-    button_texts.update(chat_state.get("field_options", []))
     return text in button_texts
 
 
@@ -1933,6 +1921,9 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin and await handle_pending_admin_input(update, context, chat_state):
         return
 
+    if admin and is_service_button_text(text, chat_state):
+        clear_admin_prompt(context)
+
     if text == BUTTON_LIST:
         await list_cmd(update, context)
         return
@@ -2070,6 +2061,9 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = state[str(update.effective_chat.id)]
     data = query.data or ""
     promotions: List[Dict[str, Any]] = []
+
+    if not data.startswith("prompt:"):
+        clear_admin_prompt(context)
 
     if data == "date:today":
         chat_state["date"] = now_date_str()
