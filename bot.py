@@ -33,15 +33,11 @@ STATE_FILE = "state.json"
 BUTTON_PLUS = "+"
 BUTTON_MINUS = "-"
 BUTTON_LIST = "Список"
-BUTTON_MENU = "Меню"
 BUTTON_OPEN = "Открыть запись"
 BUTTON_CLOSE = "Закрыть запись"
-BUTTON_TODAY = "Сегодня"
-BUTTON_TOMORROW = "Завтра"
 BUTTON_SET_DATETIME = "Изменить дату/время"
 BUTTON_SET_FIELD = "Изменить поле"
-BUTTON_SET_SCHEDULE = "Настроить расписание"
-BUTTON_SHOW_SCHEDULE = "Расписание"
+BUTTON_SHOW_SCHEDULE = "Расписания"
 
 WEEKDAY_RU = [
     "Понедельник",
@@ -129,6 +125,8 @@ def build_default_state() -> Dict[str, Any]:
             "events_completed": 0,
             "participants": {},
         },
+        "schedules": [],
+        "active_schedule_id": None,
         "schedule": {
             "enabled": False,
             "weekday": None,
@@ -159,6 +157,18 @@ def create_guest_entry(
         "owner_username": owner_username,
         "sort_key": sort_key,
         "joined_at": joined_at,
+    }
+
+
+def make_schedule_entry(name: str, weekday: int, time_value: str, field: str, schedule_id: Optional[str] = None) -> Dict[str, Any]:
+    normalized_name = name.strip() or f"{WEEKDAY_RU[weekday]} {time_value}"
+    return {
+        "id": schedule_id or f"schedule:{weekday}:{time_value}:{normalized_name.lower()}",
+        "name": normalized_name,
+        "enabled": True,
+        "weekday": weekday,
+        "time": time_value,
+        "field": field.strip() or DEFAULT_FIELD,
     }
 
 
@@ -292,6 +302,60 @@ def normalize_chat_state(chat_state: Dict[str, Any]) -> Dict[str, Any]:
         weekday = normalized["schedule"]["weekday"]
         normalized["schedule"]["weekday"] = int(weekday) if weekday is not None else None
     except (TypeError, ValueError):
+        normalized["schedule"]["weekday"] = None
+
+    schedules_raw = normalized.get("schedules", [])
+    schedules: List[Dict[str, Any]] = []
+    if isinstance(schedules_raw, list):
+        for index, item in enumerate(schedules_raw):
+            if not isinstance(item, dict):
+                continue
+            try:
+                weekday_value = int(item.get("weekday"))
+            except (TypeError, ValueError):
+                continue
+            schedules.append(
+                make_schedule_entry(
+                    item.get("name") or f"Расписание {index + 1}",
+                    weekday_value,
+                    item.get("time") or DEFAULT_TIME,
+                    item.get("field") or DEFAULT_FIELD,
+                    schedule_id=item.get("id") or f"schedule:{index}",
+                )
+            )
+
+    if not schedules and normalized["schedule"].get("enabled") and normalized["schedule"].get("weekday") is not None:
+        schedules.append(
+            make_schedule_entry(
+                "Основное расписание",
+                int(normalized["schedule"]["weekday"]),
+                normalized["schedule"].get("time", DEFAULT_TIME),
+                normalized["schedule"].get("field", DEFAULT_FIELD),
+                schedule_id="default",
+            )
+        )
+
+    normalized["schedules"] = schedules[:10]
+    active_schedule_id = normalized.get("active_schedule_id")
+    if active_schedule_id is None and normalized["schedules"]:
+        active_schedule_id = normalized["schedules"][0]["id"]
+    if active_schedule_id and not any(item["id"] == active_schedule_id for item in normalized["schedules"]):
+        active_schedule_id = normalized["schedules"][0]["id"] if normalized["schedules"] else None
+    normalized["active_schedule_id"] = active_schedule_id
+
+    active_schedule = next(
+        (item for item in normalized["schedules"] if item["id"] == normalized["active_schedule_id"]),
+        None,
+    )
+    if active_schedule:
+        normalized["schedule"] = {
+            "enabled": True,
+            "weekday": active_schedule["weekday"],
+            "time": active_schedule["time"],
+            "field": active_schedule["field"],
+        }
+    else:
+        normalized["schedule"]["enabled"] = False
         normalized["schedule"]["weekday"] = None
     normalized["field_options"] = [
         item.strip()
@@ -435,6 +499,29 @@ def parse_schedule_input(value: str) -> Dict[str, Any]:
     }
 
 
+def parse_named_schedule_input(value: str) -> Dict[str, Any]:
+    cleaned = value.strip()
+    if "|" in cleaned:
+        name_part, body_part = [part.strip() for part in cleaned.split("|", 1)]
+        if not name_part:
+            raise ValueError("Нужно указать имя расписания до символа |")
+        payload = parse_schedule_input(body_part)
+        payload["name"] = name_part
+        return payload
+
+    payload = parse_schedule_input(cleaned)
+    payload["name"] = f"{WEEKDAY_RU[payload['weekday']]} {payload['time']}"
+    return payload
+
+
+def get_active_schedule(chat_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    active_schedule_id = chat_state.get("active_schedule_id")
+    for schedule in chat_state.get("schedules", []):
+        if schedule.get("id") == active_schedule_id:
+            return schedule
+    return chat_state.get("schedules", [None])[0]
+
+
 def next_weekday_date(target_weekday: int, base_date: Optional[datetime] = None) -> str:
     current = base_date or datetime.now()
     delta = (target_weekday - current.weekday()) % 7
@@ -442,10 +529,19 @@ def next_weekday_date(target_weekday: int, base_date: Optional[datetime] = None)
 
 
 def apply_schedule(chat_state: Dict[str, Any], base_date: Optional[datetime] = None) -> bool:
-    schedule = chat_state.get("schedule", {})
-    weekday = schedule.get("weekday")
-    if not schedule.get("enabled") or weekday is None:
+    schedule = get_active_schedule(chat_state)
+    if not schedule:
         return False
+    weekday = schedule.get("weekday")
+    if weekday is None:
+        return False
+    chat_state["active_schedule_id"] = schedule.get("id")
+    chat_state["schedule"] = {
+        "enabled": True,
+        "weekday": weekday,
+        "time": schedule.get("time", DEFAULT_TIME),
+        "field": schedule.get("field", DEFAULT_FIELD),
+    }
     chat_state["date"] = next_weekday_date(int(weekday), base_date)
     chat_state["time"] = schedule.get("time", DEFAULT_TIME)
     schedule_field = schedule.get("field") or chat_state.get("field") or DEFAULT_FIELD
@@ -457,12 +553,13 @@ def apply_schedule(chat_state: Dict[str, Any], base_date: Optional[datetime] = N
 
 
 def schedule_text(chat_state: Dict[str, Any]) -> str:
-    schedule = chat_state.get("schedule", {})
-    if not schedule.get("enabled") or schedule.get("weekday") is None:
+    schedule = get_active_schedule(chat_state)
+    if not schedule or schedule.get("weekday") is None:
         return "Расписание не настроено."
     weekday_name = WEEKDAY_RU[int(schedule["weekday"])]
     next_date = next_weekday_date(int(schedule["weekday"]))
     return (
+        f"{schedule.get('name', 'Расписание')}\n"
         f"Каждую {weekday_name.lower()}\n"
         f"Следующая игра: {next_date}\n"
         f"Поле: {schedule.get('field', DEFAULT_FIELD)}\n"
@@ -861,6 +958,14 @@ def remove_owner_and_guests(chat_state: Dict[str, Any], user_id: int) -> Tuple[O
     return removed_owner, removed_total
 
 
+def remove_owner_only(chat_state: Dict[str, Any], user_id: int) -> Optional[Dict[str, Any]]:
+    for list_name in ("players", "reserve"):
+        for index, participant in enumerate(chat_state[list_name]):
+            if participant.get("kind") != "guest" and participant.get("user_id") == user_id:
+                return chat_state[list_name].pop(index)
+    return None
+
+
 def rebalance_lists(chat_state: Dict[str, Any]) -> List[Dict[str, Any]]:
     players = chat_state["players"]
     reserve = chat_state["reserve"]
@@ -910,12 +1015,12 @@ async def notify_promotions(
 
 
 def build_reply_keyboard(chat_state: Dict[str, Any], admin: bool) -> ReplyKeyboardMarkup:
-    rows: List[List[str]] = [[BUTTON_LIST, BUTTON_MENU]]
+    rows: List[List[str]] = [[BUTTON_LIST]]
 
     if admin:
         rows.append([BUTTON_OPEN, BUTTON_CLOSE])
         rows.append([BUTTON_SET_DATETIME, BUTTON_SET_FIELD])
-        rows.append([BUTTON_SET_SCHEDULE, BUTTON_SHOW_SCHEDULE])
+        rows.append([BUTTON_SHOW_SCHEDULE])
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -957,11 +1062,7 @@ def build_admin_panel(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Изменить поле", callback_data="prompt:field"),
         ]
     )
-    rows.append(
-        [
-            InlineKeyboardButton("Настроить расписание", callback_data="prompt:schedule"),
-        ]
-    )
+    rows.append([InlineKeyboardButton("Расписания", callback_data="schedule:hub")])
     rows.append([InlineKeyboardButton("Обновить список", callback_data="show:list")])
     return InlineKeyboardMarkup(rows)
 
@@ -992,17 +1093,42 @@ def clear_admin_prompt(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_prompt", None)
 
 
+def build_schedule_hub_markup(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for index, schedule in enumerate(chat_state.get("schedules", [])[:8]):
+        active_marker = "✅ " if schedule.get("id") == chat_state.get("active_schedule_id") else ""
+        rows.append(
+            [InlineKeyboardButton(f"{active_marker}{schedule.get('name', f'Расписание {index + 1}')}", callback_data=f"schedule:view:{index}")]
+        )
+
+    rows.append([InlineKeyboardButton("Создать новое", callback_data="schedule:create")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_schedule_detail_markup(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Применить", callback_data=f"schedule:apply:{index}"),
+                InlineKeyboardButton("Изменить", callback_data=f"schedule:edit:{index}"),
+            ],
+            [
+                InlineKeyboardButton("Удалить", callback_data=f"schedule:delete:{index}"),
+                InlineKeyboardButton("Назад", callback_data="schedule:hub"),
+            ],
+        ]
+    )
+
+
 def is_service_button_text(text: str, chat_state: Dict[str, Any]) -> bool:
     button_texts = {
         BUTTON_PLUS,
         BUTTON_MINUS,
         BUTTON_LIST,
-        BUTTON_MENU,
         BUTTON_OPEN,
         BUTTON_CLOSE,
         BUTTON_SET_DATETIME,
         BUTTON_SET_FIELD,
-        BUTTON_SET_SCHEDULE,
         BUTTON_SHOW_SCHEDULE,
         "+1",
         "+2",
@@ -1046,13 +1172,12 @@ def help_text() -> str:
         "/open [ДД/ММ/ГГ] [ЧЧ:ММ-ЧЧ:ММ]\n"
         "/close\n"
         "/list\n"
-        "/menu\n"
         "/setdate ДД/ММ/ГГ\n"
         "/settime ЧЧ:ММ-ЧЧ:ММ\n"
         "/setdatetime ДД/ММ/ГГ ЧЧ:ММ-ЧЧ:ММ\n"
         "/setfield НАЗВАНИЕ\n"
         "/setfields Поле 1 | Поле 2 | Поле 3\n"
-        "/schedule [пятница 20:30-22:30 Горизонт-арена|off]\n"
+        "/schedule [Название | пятница 20:30-22:30 Горизонт-арена|off]\n"
         "/setlimit N\n"
         "/remove @username|Имя\n"
         "/noshow @username|Имя\n"
@@ -1084,6 +1209,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
+async def show_schedule_hub_message(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_state: Dict[str, Any]):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "Расписания:",
+        reply_markup=build_schedule_hub_markup(chat_state),
+    )
+
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None:
         return
@@ -1099,7 +1234,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_in_chat(
         update,
         context,
-        "Клавиатура подключена. Можно записываться кнопками, а админам доступна панель ниже.",
+        "Клавиатура подключена.",
         chat_state=chat_state,
         admin=admin,
     )
@@ -1359,16 +1494,12 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = " ".join(context.args).strip()
 
     if not raw_text:
-        await reply_in_chat(
-            update,
-            context,
-            schedule_text(chat_state),
-            chat_state=chat_state,
-            admin=True,
-        )
+        await show_schedule_hub_message(update, context, chat_state)
         return
 
     if raw_text.lower() == "off":
+        chat_state["schedules"] = []
+        chat_state["active_schedule_id"] = None
         chat_state["schedule"] = {
             "enabled": False,
             "weekday": None,
@@ -1386,8 +1517,23 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        chat_state["schedule"] = parse_schedule_input(raw_text)
-        schedule_field = chat_state["schedule"]["field"]
+        payload = parse_named_schedule_input(raw_text)
+        schedule_entry = make_schedule_entry(
+            payload["name"],
+            payload["weekday"],
+            payload["time"],
+            payload["field"],
+            schedule_id=f"schedule:{len(chat_state.get('schedules', [])) + 1}",
+        )
+        chat_state["schedules"].append(schedule_entry)
+        chat_state["active_schedule_id"] = schedule_entry["id"]
+        chat_state["schedule"] = {
+            "enabled": True,
+            "weekday": schedule_entry["weekday"],
+            "time": schedule_entry["time"],
+            "field": schedule_entry["field"],
+        }
+        schedule_field = schedule_entry["field"]
         if schedule_field not in chat_state.get("field_options", []):
             chat_state["field_options"] = [schedule_field] + chat_state.get("field_options", [])
             chat_state["field_options"] = chat_state["field_options"][:3]
@@ -2013,7 +2159,7 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_promotions(update.effective_chat.id, context, promotions)
         return
 
-    removed_participant, _ = remove_owner_and_guests(chat_state, update.effective_user.id)
+    removed_participant = remove_owner_only(chat_state, update.effective_user.id)
     if list_name == "players":
         chat_state["noshow"] = [
             item for item in chat_state.get("noshow", []) if item != participant_key(participant)
@@ -2067,22 +2213,54 @@ async def handle_pending_admin_input(
                 chat_state["field_options"] = [text] + chat_state.get("field_options", [])
                 chat_state["field_options"] = chat_state["field_options"][:3]
             reply_text = "Поле обновлено ✅\n\n" + format_list(chat_state)
-        elif mode == "schedule":
-            if text.lower() == "off":
-                chat_state["schedule"] = {
-                    "enabled": False,
-                    "weekday": None,
-                    "time": chat_state.get("time", DEFAULT_TIME),
-                    "field": chat_state.get("field", DEFAULT_FIELD),
-                }
-                reply_text = "Расписание отключено."
-            else:
-                chat_state["schedule"] = parse_schedule_input(text)
-                schedule_field = chat_state["schedule"]["field"]
-                if schedule_field not in chat_state.get("field_options", []):
-                    chat_state["field_options"] = [schedule_field] + chat_state.get("field_options", [])
-                    chat_state["field_options"] = chat_state["field_options"][:3]
-                reply_text = "Расписание сохранено ✅\n\n" + schedule_text(chat_state)
+        elif mode == "schedule_new":
+            payload = parse_named_schedule_input(text)
+            schedule_entry = make_schedule_entry(
+                payload["name"],
+                payload["weekday"],
+                payload["time"],
+                payload["field"],
+                schedule_id=f"schedule:{len(chat_state.get('schedules', [])) + 1}",
+            )
+            chat_state["schedules"].append(schedule_entry)
+            chat_state["active_schedule_id"] = schedule_entry["id"]
+            chat_state["schedule"] = {
+                "enabled": True,
+                "weekday": schedule_entry["weekday"],
+                "time": schedule_entry["time"],
+                "field": schedule_entry["field"],
+            }
+            schedule_field = schedule_entry["field"]
+            if schedule_field not in chat_state.get("field_options", []):
+                chat_state["field_options"] = [schedule_field] + chat_state.get("field_options", [])
+                chat_state["field_options"] = chat_state["field_options"][:3]
+            reply_text = "Расписание сохранено ✅\n\n" + schedule_text(chat_state)
+        elif isinstance(mode, str) and mode.startswith("schedule_edit:"):
+            schedule_index = int(mode.split(":", 1)[1])
+            payload = parse_named_schedule_input(text)
+            if not (0 <= schedule_index < len(chat_state.get("schedules", []))):
+                raise ValueError("Это расписание уже не найдено.")
+            existing_schedule = chat_state["schedules"][schedule_index]
+            updated_schedule = make_schedule_entry(
+                payload["name"],
+                payload["weekday"],
+                payload["time"],
+                payload["field"],
+                schedule_id=existing_schedule["id"],
+            )
+            chat_state["schedules"][schedule_index] = updated_schedule
+            chat_state["active_schedule_id"] = updated_schedule["id"]
+            chat_state["schedule"] = {
+                "enabled": True,
+                "weekday": updated_schedule["weekday"],
+                "time": updated_schedule["time"],
+                "field": updated_schedule["field"],
+            }
+            schedule_field = updated_schedule["field"]
+            if schedule_field not in chat_state.get("field_options", []):
+                chat_state["field_options"] = [schedule_field] + chat_state.get("field_options", [])
+                chat_state["field_options"] = chat_state["field_options"][:3]
+            reply_text = "Расписание обновлено ✅\n\n" + schedule_text(chat_state)
         else:
             clear_admin_prompt(context)
             return False
@@ -2120,9 +2298,6 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BUTTON_LIST:
         await list_cmd(update, context)
         return
-    if text == BUTTON_MENU:
-        await menu_cmd(update, context)
-        return
 
     if not admin:
         return
@@ -2154,30 +2329,6 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == BUTTON_TODAY:
-        chat_state["date"] = now_date_str()
-        save_state()
-        await reply_in_chat(
-            update,
-            context,
-            "Дата переключена на сегодня ✅\n\n" + format_list(chat_state),
-            chat_state=chat_state,
-            admin=True,
-        )
-        return
-
-    if text == BUTTON_TOMORROW:
-        chat_state["date"] = (datetime.now() + timedelta(days=1)).strftime("%d/%m/%y")
-        save_state()
-        await reply_in_chat(
-            update,
-            context,
-            "Дата переключена на завтра ✅\n\n" + format_list(chat_state),
-            chat_state=chat_state,
-            admin=True,
-        )
-        return
-
     if text == BUTTON_SET_DATETIME:
         prompt_message = await update.effective_message.reply_text(
             "Отправь дату и время ответом на это сообщение.\nПример: 25/04/26 20:30-22:30"
@@ -2202,38 +2353,9 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == BUTTON_SET_SCHEDULE:
-        prompt_message = await update.effective_message.reply_text(
-            "Напиши расписание ответом на это сообщение:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off"
-        )
-        set_admin_prompt(
-            context,
-            update.effective_chat.id,
-            "schedule",
-            prompt_message_id=prompt_message.message_id,
-        )
-        return
-
     if text == BUTTON_SHOW_SCHEDULE:
-        await reply_in_chat(
-            update,
-            context,
-            schedule_text(chat_state),
-            chat_state=chat_state,
-            admin=True,
-        )
+        await show_schedule_hub_message(update, context, chat_state)
         return
-
-    if text in chat_state.get("field_options", []):
-        chat_state["field"] = text
-        save_state()
-        await reply_in_chat(
-            update,
-            context,
-            "Поле обновлено ✅\n\n" + format_list(chat_state),
-            chat_state=chat_state,
-            admin=True,
-        )
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2296,18 +2418,87 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "field",
             prompt_message_id=prompt_message.message_id,
         )
-    elif data == "prompt:schedule":
+    elif data == "show:list":
+        pass
+    elif data == "schedule:hub":
+        await query.edit_message_text(
+            "Расписания:",
+            reply_markup=build_schedule_hub_markup(chat_state),
+        )
+        return
+    elif data == "schedule:create":
         prompt_message = await query.message.reply_text(
-            "Напиши расписание ответом на это сообщение:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off"
+            "Отправь новое расписание ответом на это сообщение.\nФормат:\nНазвание | пятница 20:30-22:30 Горизонт-арена"
         )
         set_admin_prompt(
             context,
             update.effective_chat.id,
-            "schedule",
+            "schedule_new",
             prompt_message_id=prompt_message.message_id,
         )
-    elif data == "show:list":
-        pass
+        return
+    elif data.startswith("schedule:view:"):
+        schedule_index = int(data.rsplit(":", 1)[1])
+        if not (0 <= schedule_index < len(chat_state.get("schedules", []))):
+            await query.answer("Расписание не найдено", show_alert=True)
+            return
+        schedule = chat_state["schedules"][schedule_index]
+        detail_text = (
+            f"{schedule.get('name', 'Расписание')}\n"
+            f"Каждую {WEEKDAY_RU[int(schedule['weekday'])].lower()}\n"
+            f"Поле: {schedule.get('field', DEFAULT_FIELD)}\n"
+            f"Время: {schedule.get('time', DEFAULT_TIME)}"
+        )
+        await query.edit_message_text(detail_text, reply_markup=build_schedule_detail_markup(schedule_index))
+        return
+    elif data.startswith("schedule:apply:"):
+        schedule_index = int(data.rsplit(":", 1)[1])
+        if not (0 <= schedule_index < len(chat_state.get("schedules", []))):
+            await query.answer("Расписание не найдено", show_alert=True)
+            return
+        selected = chat_state["schedules"][schedule_index]
+        chat_state["active_schedule_id"] = selected["id"]
+        apply_schedule(chat_state)
+        save_state()
+        await query.edit_message_text(
+            "Расписание применено ✅\n\n" + schedule_text(chat_state),
+            reply_markup=build_schedule_detail_markup(schedule_index),
+        )
+        return
+    elif data.startswith("schedule:edit:"):
+        schedule_index = int(data.rsplit(":", 1)[1])
+        if not (0 <= schedule_index < len(chat_state.get("schedules", []))):
+            await query.answer("Расписание не найдено", show_alert=True)
+            return
+        prompt_message = await query.message.reply_text(
+            "Ответь на это сообщение обновлённым расписанием.\nФормат:\nНазвание | пятница 20:30-22:30 Горизонт-арена"
+        )
+        set_admin_prompt(
+            context,
+            update.effective_chat.id,
+            f"schedule_edit:{schedule_index}",
+            prompt_message_id=prompt_message.message_id,
+        )
+        return
+    elif data.startswith("schedule:delete:"):
+        schedule_index = int(data.rsplit(":", 1)[1])
+        if not (0 <= schedule_index < len(chat_state.get("schedules", []))):
+            await query.answer("Расписание не найдено", show_alert=True)
+            return
+        removed = chat_state["schedules"].pop(schedule_index)
+        if chat_state.get("active_schedule_id") == removed.get("id"):
+            chat_state["active_schedule_id"] = chat_state["schedules"][0]["id"] if chat_state["schedules"] else None
+        apply_schedule(chat_state) if chat_state.get("schedules") else None
+        if not chat_state.get("schedules"):
+            chat_state["schedule"] = {
+                "enabled": False,
+                "weekday": None,
+                "time": chat_state.get("time", DEFAULT_TIME),
+                "field": chat_state.get("field", DEFAULT_FIELD),
+            }
+        save_state()
+        await query.edit_message_text("Расписания:", reply_markup=build_schedule_hub_markup(chat_state))
+        return
 
     promotions.extend(rebalance_lists(chat_state))
     record_promotion_stats(chat_state, promotions)
@@ -2370,7 +2561,7 @@ def main():
     app.add_handler(CommandHandler("ads", ads_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(date|time|field|toggle|show|prompt):"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(date|time|field|toggle|show|prompt|schedule):"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_message))
