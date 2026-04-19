@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import re
@@ -1645,7 +1644,7 @@ async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYP
     save_state()
 
 
-async def main():
+def main():
     load_state()
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -1681,7 +1680,7 @@ async def main():
     app.add_handler(ChatMemberHandler(handle_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
 
     print("Bot is running. Press Ctrl+C to stop.")
-    await app.run_polling(close_loop=False)
+    app.run_polling()
 
 
 if __name__ == "__main__":
@@ -1692,4 +1691,4 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    asyncio.run(main())
+    main()
