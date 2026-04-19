@@ -1015,14 +1015,13 @@ async def notify_promotions(
 
 
 def build_reply_keyboard(chat_state: Dict[str, Any], admin: bool) -> ReplyKeyboardMarkup:
-    rows: List[List[str]] = [[BUTTON_LIST]]
-
     if admin:
+        rows: List[List[str]] = [[BUTTON_LIST]]
         rows.append([BUTTON_OPEN, BUTTON_CLOSE])
         rows.append([BUTTON_SET_DATETIME, BUTTON_SET_FIELD])
         rows.append([BUTTON_SHOW_SCHEDULE])
-
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, selective=True)
+    raise ValueError("Reply keyboard is available only for admins.")
 
 
 def build_admin_panel(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1156,7 +1155,8 @@ async def reply_in_chat(
     if markup is None and update.effective_chat is not None and chat_state is not None:
         if admin is None:
             admin = await is_admin(update, context)
-        markup = build_reply_keyboard(chat_state, admin)
+        if admin:
+            markup = build_reply_keyboard(chat_state, admin)
 
     await message.reply_text(text, reply_markup=markup)
 
@@ -2120,9 +2120,20 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = state[str(update.effective_chat.id)]
     admin = await is_admin(update, context)
     action, count = parse_minus_action(update.effective_message.text or "-")
+    guest_entries = get_guest_entries(chat_state, update.effective_user.id)
 
     list_name, index = find_participant(chat_state, update.effective_user.id)
-    if list_name is None or index is None:
+    if action == "guests" and not guest_entries:
+        await reply_in_chat(
+            update,
+            context,
+            "У тебя нет такого количества гостей, чтобы уменьшить запись.",
+            chat_state=chat_state,
+            admin=admin,
+        )
+        return
+
+    if action != "guests" and (list_name is None or index is None):
         await reply_in_chat(
             update,
             context,
@@ -2136,15 +2147,6 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "guests":
         removed = remove_latest_guests(chat_state, update.effective_user.id, count)
-        if removed == 0:
-            await reply_in_chat(
-                update,
-                context,
-                "У тебя нет такого количества гостей, чтобы уменьшить запись.",
-                chat_state=chat_state,
-                admin=admin,
-            )
-            return
 
         promotions = rebalance_lists(chat_state)
         record_promotion_stats(chat_state, promotions)
