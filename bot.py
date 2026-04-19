@@ -809,17 +809,26 @@ def build_admin_panel(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def set_admin_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mode: str):
-    context.user_data["admin_prompt"] = {"chat_id": chat_id, "mode": mode}
+def set_admin_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    mode: str,
+    prompt_message_id: Optional[int] = None,
+):
+    context.user_data["admin_prompt"] = {
+        "chat_id": chat_id,
+        "mode": mode,
+        "prompt_message_id": prompt_message_id,
+    }
 
 
-def get_admin_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[str]:
+def get_admin_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Optional[Dict[str, Any]]:
     prompt = context.user_data.get("admin_prompt")
     if not isinstance(prompt, dict):
         return None
     if prompt.get("chat_id") != chat_id:
         return None
-    return prompt.get("mode")
+    return prompt
 
 
 def clear_admin_prompt(context: ContextTypes.DEFAULT_TYPE):
@@ -1713,7 +1722,29 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     existing_list, _ = find_participant(chat_state, update.effective_user.id)
+    guest_count = parse_plus_guest_count(update.effective_message.text or "")
+
     if existing_list == "players":
+        if guest_count > 0:
+            existing = next(
+                participant
+                for participant in chat_state["players"]
+                if participant.get("user_id") == update.effective_user.id
+            )
+            existing["guest_count"] = max(0, min(5, int(existing.get("guest_count", 0) or 0) + guest_count))
+            promotions = rebalance_lists(chat_state)
+            record_promotion_stats(chat_state, promotions)
+            save_state()
+            await reply_in_chat(
+                update,
+                context,
+                f"Обновил запись: теперь {participant_label(existing)} ✅\n\n" + format_list(chat_state),
+                chat_state=chat_state,
+                admin=admin,
+            )
+            await notify_promotions(update.effective_chat.id, context, promotions)
+            return
+
         await reply_in_chat(
             update,
             context,
@@ -1722,7 +1753,30 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin=admin,
         )
         return
+
     if existing_list == "reserve":
+        if guest_count > 0:
+            existing = next(
+                participant
+                for participant in chat_state["reserve"]
+                if participant.get("user_id") == update.effective_user.id
+            )
+            existing["guest_count"] = max(0, min(5, int(existing.get("guest_count", 0) or 0) + guest_count))
+            promotions = rebalance_lists(chat_state)
+            record_promotion_stats(chat_state, promotions)
+            save_state()
+            current_list_name, _ = find_participant(chat_state, update.effective_user.id)
+            status_text = "Ты уже в основном составе ✅" if current_list_name == "players" else "Обновил запись в резерве ⏳"
+            await reply_in_chat(
+                update,
+                context,
+                f"{status_text}: теперь {participant_label(existing)}\n\n" + format_list(chat_state),
+                chat_state=chat_state,
+                admin=admin,
+            )
+            await notify_promotions(update.effective_chat.id, context, promotions)
+            return
+
         await reply_in_chat(
             update,
             context,
@@ -1732,7 +1786,6 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    guest_count = parse_plus_guest_count(update.effective_message.text or "")
     participant = participant_from_update(update, guest_count=guest_count)
     group_size = participant_size(participant)
     limit = chat_state.get("limit", 0)
@@ -1807,11 +1860,17 @@ async def handle_pending_admin_input(
     if update.effective_chat is None or update.effective_message is None:
         return False
 
-    mode = get_admin_prompt(context, update.effective_chat.id)
-    if not mode:
+    prompt = get_admin_prompt(context, update.effective_chat.id)
+    if not prompt:
         return False
 
     text = (update.effective_message.text or "").strip()
+    mode = prompt.get("mode")
+    prompt_message_id = prompt.get("prompt_message_id")
+
+    replied_message = update.effective_message.reply_to_message
+    if prompt_message_id and (replied_message is None or replied_message.message_id != prompt_message_id):
+        return False
     if is_service_button_text(text, chat_state):
         return False
 
@@ -1936,35 +1995,38 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == BUTTON_SET_DATETIME:
-        set_admin_prompt(context, update.effective_chat.id, "datetime")
-        await reply_in_chat(
-            update,
+        prompt_message = await update.effective_message.reply_text(
+            "Отправь дату и время ответом на это сообщение.\nПример: 25/04/26 20:30-22:30"
+        )
+        set_admin_prompt(
             context,
-            "Отправь дату и время в одном сообщении.\nПример: 25/04/26 20:30-22:30",
-            chat_state=chat_state,
-            admin=True,
+            update.effective_chat.id,
+            "datetime",
+            prompt_message_id=prompt_message.message_id,
         )
         return
 
     if text == BUTTON_SET_FIELD:
-        set_admin_prompt(context, update.effective_chat.id, "field")
-        await reply_in_chat(
-            update,
+        prompt_message = await update.effective_message.reply_text(
+            "Напиши новое название поля ответом на это сообщение."
+        )
+        set_admin_prompt(
             context,
-            "Напиши новое название поля одним сообщением.",
-            chat_state=chat_state,
-            admin=True,
+            update.effective_chat.id,
+            "field",
+            prompt_message_id=prompt_message.message_id,
         )
         return
 
     if text == BUTTON_SET_SCHEDULE:
-        set_admin_prompt(context, update.effective_chat.id, "schedule")
-        await reply_in_chat(
-            update,
+        prompt_message = await update.effective_message.reply_text(
+            "Напиши расписание ответом на это сообщение:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off"
+        )
+        set_admin_prompt(
             context,
-            "Напиши расписание в формате:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off",
-            chat_state=chat_state,
-            admin=True,
+            update.effective_chat.id,
+            "schedule",
+            prompt_message_id=prompt_message.message_id,
         )
         return
 
@@ -2028,15 +2090,34 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "toggle:close":
         chat_state["open"] = False
     elif data == "prompt:datetime":
-        set_admin_prompt(context, update.effective_chat.id, "datetime")
-        await query.message.reply_text("Отправь дату и время: 25/04/26 20:30-22:30")
+        prompt_message = await query.message.reply_text(
+            "Отправь дату и время ответом на это сообщение: 25/04/26 20:30-22:30"
+        )
+        set_admin_prompt(
+            context,
+            update.effective_chat.id,
+            "datetime",
+            prompt_message_id=prompt_message.message_id,
+        )
     elif data == "prompt:field":
-        set_admin_prompt(context, update.effective_chat.id, "field")
-        await query.message.reply_text("Напиши новое название поля одним сообщением.")
+        prompt_message = await query.message.reply_text(
+            "Напиши новое название поля ответом на это сообщение."
+        )
+        set_admin_prompt(
+            context,
+            update.effective_chat.id,
+            "field",
+            prompt_message_id=prompt_message.message_id,
+        )
     elif data == "prompt:schedule":
-        set_admin_prompt(context, update.effective_chat.id, "schedule")
-        await query.message.reply_text(
-            "Напиши расписание в формате:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off"
+        prompt_message = await query.message.reply_text(
+            "Напиши расписание ответом на это сообщение:\nпятница 20:30-22:30 Горизонт-арена\n\nЧтобы выключить расписание, отправь: off"
+        )
+        set_admin_prompt(
+            context,
+            update.effective_chat.id,
+            "schedule",
+            prompt_message_id=prompt_message.message_id,
         )
     elif data == "show:list":
         pass
