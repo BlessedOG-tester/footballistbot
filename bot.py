@@ -347,6 +347,21 @@ def parse_plus_guest_count(value: str) -> int:
     return int(count) if count else 0
 
 
+def parse_minus_action(value: str) -> Tuple[str, int]:
+    cleaned = value.strip().lower().replace("ё", "е")
+    exact = re.match(r"^-(?P<count>[1-5])?$", cleaned)
+    if exact:
+        count = exact.group("count")
+        if count:
+            return "guests", int(count)
+        return "remove", 0
+
+    if cleaned.startswith("минус") or cleaned.startswith("не смогу") or cleaned.startswith("не получится"):
+        return "remove", 0
+
+    raise ValueError("Используй -, -1, -2, -3, -4, -5 или 'минус'")
+
+
 def parse_weekday(value: str) -> int:
     normalized = value.strip().lower()
     if normalized not in WEEKDAY_ALIASES:
@@ -1719,7 +1734,7 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for participant in chat_state["players"]
                 if participant.get("user_id") == update.effective_user.id
             )
-            existing["guest_count"] = max(0, min(5, int(existing.get("guest_count", 0) or 0) + guest_count))
+            existing["guest_count"] = guest_count
             promotions = rebalance_lists(chat_state)
             record_promotion_stats(chat_state, promotions)
             save_state()
@@ -1749,7 +1764,7 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for participant in chat_state["reserve"]
                 if participant.get("user_id") == update.effective_user.id
             )
-            existing["guest_count"] = max(0, min(5, int(existing.get("guest_count", 0) or 0) + guest_count))
+            existing["guest_count"] = guest_count
             promotions = rebalance_lists(chat_state)
             record_promotion_stats(chat_state, promotions)
             save_state()
@@ -1808,6 +1823,7 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     chat_state = state[str(update.effective_chat.id)]
     admin = await is_admin(update, context)
+    action, count = parse_minus_action(update.effective_message.text or "-")
 
     list_name, index = find_participant(chat_state, update.effective_user.id)
     if list_name is None or index is None:
@@ -1818,6 +1834,35 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_state=chat_state,
             admin=admin,
         )
+        return
+
+    participant = chat_state[list_name][index]
+
+    if action == "guests":
+        current_guests = max(0, int(participant.get("guest_count", 0) or 0))
+        new_guests = max(0, current_guests - count)
+        if new_guests == current_guests:
+            await reply_in_chat(
+                update,
+                context,
+                "У тебя нет такого количества гостей, чтобы уменьшить запись.",
+                chat_state=chat_state,
+                admin=admin,
+            )
+            return
+
+        participant["guest_count"] = new_guests
+        promotions = rebalance_lists(chat_state)
+        record_promotion_stats(chat_state, promotions)
+        save_state()
+        await reply_in_chat(
+            update,
+            context,
+            f"Обновил запись: теперь {participant_label(participant)} ✅\n\n" + format_list(chat_state),
+            chat_state=chat_state,
+            admin=admin,
+        )
+        await notify_promotions(update.effective_chat.id, context, promotions)
         return
 
     removed_participant = chat_state[list_name].pop(index)
