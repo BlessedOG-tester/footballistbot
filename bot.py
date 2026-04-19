@@ -142,12 +142,35 @@ def build_default_state() -> Dict[str, Any]:
     }
 
 
+def create_guest_entry(
+    owner_user_id: Optional[int],
+    owner_display_name: str,
+    owner_username: str,
+    sort_key: str,
+    joined_at: str,
+) -> Dict[str, Any]:
+    return {
+        "kind": "guest",
+        "user_id": None,
+        "username": "",
+        "display_name": "",
+        "owner_user_id": owner_user_id,
+        "owner_display_name": owner_display_name,
+        "owner_username": owner_username,
+        "sort_key": sort_key,
+        "joined_at": joined_at,
+    }
+
+
 def legacy_participant(name: str, position: int) -> Dict[str, Any]:
     return {
+        "kind": "owner",
         "user_id": None,
         "username": "",
         "display_name": name,
-        "guest_count": 0,
+        "owner_user_id": None,
+        "owner_display_name": name,
+        "owner_username": "",
         "sort_key": f"legacy:{position}:{name.lower()}",
         "joined_at": "",
     }
@@ -173,18 +196,42 @@ def normalize_participants(raw_items: Any) -> List[Dict[str, Any]]:
     for index, raw in enumerate(raw_items):
         if isinstance(raw, str):
             participant = legacy_participant(raw, index)
+            extras: List[Dict[str, Any]] = []
         elif isinstance(raw, dict):
             participant = {
+                "kind": raw.get("kind") or "owner",
                 "user_id": raw.get("user_id"),
                 "username": raw.get("username") or "",
                 "display_name": raw.get("display_name")
                 or raw.get("name")
                 or raw.get("title")
                 or "Без имени",
-                "guest_count": max(0, min(5, safe_int(raw.get("guest_count", 0), 0))),
+                "owner_user_id": raw.get("owner_user_id"),
+                "owner_display_name": raw.get("owner_display_name") or raw.get("display_name") or raw.get("name") or "",
+                "owner_username": raw.get("owner_username") or raw.get("username") or "",
                 "sort_key": raw.get("sort_key") or raw.get("key") or "",
                 "joined_at": raw.get("joined_at") or "",
             }
+            extras = []
+            if participant["kind"] != "guest":
+                participant["kind"] = "owner"
+                participant["owner_user_id"] = participant.get("user_id")
+                participant["owner_display_name"] = participant.get("display_name", "")
+                participant["owner_username"] = participant.get("username", "")
+                guest_count = max(0, min(5, safe_int(raw.get("guest_count", 0), 0)))
+                for guest_index in range(guest_count):
+                    extras.append(
+                        create_guest_entry(
+                            participant.get("user_id"),
+                            participant.get("display_name", ""),
+                            participant.get("username", ""),
+                            f"{participant.get('sort_key') or participant_key(participant)}:guest:{guest_index}",
+                            participant.get("joined_at", ""),
+                        )
+                    )
+            else:
+                participant["display_name"] = ""
+                participant["username"] = ""
         else:
             continue
 
@@ -193,6 +240,12 @@ def normalize_participants(raw_items: Any) -> List[Dict[str, Any]]:
             continue
         seen.add(key)
         participants.append(participant)
+        for extra in extras:
+            extra_key = participant_key(extra)
+            if extra_key in seen:
+                continue
+            seen.add(extra_key)
+            participants.append(extra)
 
     return participants
 
@@ -492,6 +545,8 @@ def participant_display_name(user) -> str:
 
 
 def participant_notify_name(participant: Dict[str, Any]) -> str:
+    if participant.get("kind") == "guest":
+        return f"+1 от {participant.get('owner_display_name', 'Игрок')}"
     username = participant.get("username")
     if username:
         return f"@{username}"
@@ -499,7 +554,7 @@ def participant_notify_name(participant: Dict[str, Any]) -> str:
 
 
 def participant_size(participant: Dict[str, Any]) -> int:
-    return 1 + max(0, int(participant.get("guest_count", 0) or 0))
+    return 1
 
 
 def total_people(participants: List[Dict[str, Any]]) -> int:
@@ -507,9 +562,8 @@ def total_people(participants: List[Dict[str, Any]]) -> int:
 
 
 def participant_label(participant: Dict[str, Any]) -> str:
-    guests = max(0, int(participant.get("guest_count", 0) or 0))
-    if guests:
-        return f"{participant['display_name']} (+{guests})"
+    if participant.get("kind") == "guest":
+        return f"+1 от {participant.get('owner_display_name', 'Игрок')}"
     return participant["display_name"]
 
 
@@ -520,15 +574,18 @@ def stats_display_name(participant: Dict[str, Any]) -> str:
     return participant.get("display_name", "Игрок")
 
 
-def participant_from_update(update: Update, guest_count: int = 0) -> Dict[str, Any]:
+def participant_from_update(update: Update) -> Dict[str, Any]:
     user = update.effective_user
     if user is None:
         return legacy_participant("Без имени", 0)
     return {
+        "kind": "owner",
         "user_id": user.id,
         "username": user.username or "",
         "display_name": participant_display_name(user),
-        "guest_count": max(0, min(5, int(guest_count))),
+        "owner_user_id": user.id,
+        "owner_display_name": participant_display_name(user),
+        "owner_username": user.username or "",
         "sort_key": f"user:{user.id}",
         "joined_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
@@ -589,6 +646,8 @@ def is_no_show(chat_state: Dict[str, Any], participant: Dict[str, Any]) -> bool:
 
 def record_promotion_stats(chat_state: Dict[str, Any], promotions: List[Dict[str, Any]]):
     for participant in promotions:
+        if participant.get("kind") == "guest":
+            continue
         entry = ensure_stats_entry(chat_state, participant)
         entry["promotions"] += 1
 
@@ -603,6 +662,8 @@ def finalize_event_stats(chat_state: Dict[str, Any]) -> Dict[str, int]:
     reserve_only = 0
 
     for participant in players:
+        if participant.get("kind") == "guest":
+            continue
         entry = ensure_stats_entry(chat_state, participant)
         entry["captured_games"] += 1
         if participant_key(participant) in no_show_keys:
@@ -612,8 +673,14 @@ def finalize_event_stats(chat_state: Dict[str, Any]) -> Dict[str, int]:
             entry["visits"] += 1
             visits += 1
 
-    player_keys = {participant_key(participant) for participant in players}
+    player_keys = {
+        participant_key(participant)
+        for participant in players
+        if participant.get("kind") != "guest"
+    }
     for participant in reserve:
+        if participant.get("kind") == "guest":
+            continue
         if participant_key(participant) in player_keys:
             continue
         entry = ensure_stats_entry(chat_state, participant)
@@ -695,7 +762,7 @@ def build_stats_summary(chat_state: Dict[str, Any], query: str = "") -> str:
 def find_participant(chat_state: Dict[str, Any], user_id: int) -> Tuple[Optional[str], Optional[int]]:
     for list_name in ("players", "reserve"):
         for index, participant in enumerate(chat_state[list_name]):
-            if participant.get("user_id") == user_id:
+            if participant.get("kind") != "guest" and participant.get("user_id") == user_id:
                 return list_name, index
     return None, None
 
@@ -705,9 +772,93 @@ def find_players_by_text(participants: List[Dict[str, Any]], query: str) -> List
     return [
         participant
         for participant in participants
+        if participant.get("kind") != "guest"
         if query_lower in participant.get("display_name", "").lower()
         or query_lower in participant.get("username", "").lower()
     ]
+
+
+def owner_identity(participant: Dict[str, Any]) -> str:
+    user_id = participant.get("user_id") or participant.get("owner_user_id")
+    if user_id is not None:
+        return f"user:{user_id}"
+    return participant.get("owner_display_name") or participant.get("display_name") or participant_key(participant)
+
+
+def get_owner_participant(chat_state: Dict[str, Any], user_id: int) -> Optional[Dict[str, Any]]:
+    for list_name in ("players", "reserve"):
+        for participant in chat_state[list_name]:
+            if participant.get("kind") != "guest" and participant.get("user_id") == user_id:
+                return participant
+    return None
+
+
+def get_guest_entries(chat_state: Dict[str, Any], user_id: int) -> List[Tuple[str, int, Dict[str, Any]]]:
+    matches: List[Tuple[str, int, Dict[str, Any]]] = []
+    for list_name in ("players", "reserve"):
+        for index, participant in enumerate(chat_state[list_name]):
+            if participant.get("kind") == "guest" and participant.get("owner_user_id") == user_id:
+                matches.append((list_name, index, participant))
+    return matches
+
+
+def create_guest_entries_for_owner(owner: Dict[str, Any], count: int) -> List[Dict[str, Any]]:
+    timestamp = datetime.utcnow().isoformat(timespec="seconds")
+    return [
+        create_guest_entry(
+            owner.get("user_id"),
+            owner.get("display_name", "Игрок"),
+            owner.get("username", ""),
+            f"{owner.get('sort_key', participant_key(owner))}:guest:{timestamp}:{index}",
+            timestamp,
+        )
+        for index in range(count)
+    ]
+
+
+def add_entries_with_limit(chat_state: Dict[str, Any], entries: List[Dict[str, Any]]) -> None:
+    limit = chat_state.get("limit", 0)
+    for entry in entries:
+        if limit and len(chat_state["players"]) >= limit:
+            chat_state["reserve"].append(entry)
+        else:
+            chat_state["players"].append(entry)
+
+
+def remove_latest_guests(chat_state: Dict[str, Any], user_id: int, count: int) -> int:
+    removed = 0
+    for list_name in ("reserve", "players"):
+        indexes = [
+            index
+            for index, participant in enumerate(chat_state[list_name])
+            if participant.get("kind") == "guest" and participant.get("owner_user_id") == user_id
+        ]
+        for index in reversed(indexes):
+            if removed >= count:
+                return removed
+            chat_state[list_name].pop(index)
+            removed += 1
+    return removed
+
+
+def remove_owner_and_guests(chat_state: Dict[str, Any], user_id: int) -> Tuple[Optional[Dict[str, Any]], int]:
+    removed_owner: Optional[Dict[str, Any]] = None
+    removed_total = 0
+    for list_name in ("players", "reserve"):
+        new_items: List[Dict[str, Any]] = []
+        for participant in chat_state[list_name]:
+            is_owner = participant.get("kind") != "guest" and participant.get("user_id") == user_id
+            is_guest = participant.get("kind") == "guest" and participant.get("owner_user_id") == user_id
+            if is_owner:
+                removed_owner = participant
+                removed_total += 1
+                continue
+            if is_guest:
+                removed_total += 1
+                continue
+            new_items.append(participant)
+        chat_state[list_name] = new_items
+    return removed_owner, removed_total
 
 
 def rebalance_lists(chat_state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1324,40 +1475,31 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    removed_from_main = [
-        participant
-        for participant in chat_state["players"]
-        if key in participant.get("display_name", "").lower()
-        or key in participant.get("username", "").lower()
-    ]
-    removed_from_reserve = [
-        participant
-        for participant in chat_state["reserve"]
-        if key in participant.get("display_name", "").lower()
-        or key in participant.get("username", "").lower()
-    ]
+    owners_to_remove = {
+        participant.get("user_id")
+        for participant in chat_state["players"] + chat_state["reserve"]
+        if participant.get("kind") != "guest"
+        and (
+            key in participant.get("display_name", "").lower()
+            or key in participant.get("username", "").lower()
+        )
+        and participant.get("user_id") is not None
+    }
+    removed_total = 0
+    removed_keys: set[str] = set()
+    for owner_user_id in owners_to_remove:
+        removed_owner, removed_count = remove_owner_and_guests(chat_state, int(owner_user_id))
+        removed_total += removed_count
+        if removed_owner is not None:
+            removed_keys.add(participant_key(removed_owner))
 
-    chat_state["players"] = [
-        participant
-        for participant in chat_state["players"]
-        if participant not in removed_from_main
-    ]
-    chat_state["reserve"] = [
-        participant
-        for participant in chat_state["reserve"]
-        if participant not in removed_from_reserve
-    ]
-    removed_keys = {participant_key(item) for item in removed_from_main}
     if removed_keys:
-        chat_state["noshow"] = [
-            item for item in chat_state.get("noshow", []) if item not in removed_keys
-        ]
+        chat_state["noshow"] = [item for item in chat_state.get("noshow", []) if item not in removed_keys]
 
     promotions = rebalance_lists(chat_state)
     record_promotion_stats(chat_state, promotions)
     save_state()
 
-    removed_total = len(removed_from_main) + len(removed_from_reserve)
     await reply_in_chat(
         update,
         context,
@@ -1724,24 +1866,26 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None:
         return
 
-    existing_list, _ = find_participant(chat_state, update.effective_user.id)
     guest_count = parse_plus_guest_count(update.effective_message.text or "")
+    existing_list, _ = find_participant(chat_state, update.effective_user.id)
+    owner = get_owner_participant(chat_state, update.effective_user.id)
+    current_guest_total = len(get_guest_entries(chat_state, update.effective_user.id))
 
     if existing_list == "players":
         if guest_count > 0:
-            existing = next(
-                participant
-                for participant in chat_state["players"]
-                if participant.get("user_id") == update.effective_user.id
-            )
-            existing["guest_count"] = guest_count
+            assert owner is not None
+            delta = guest_count - current_guest_total
+            if delta > 0:
+                add_entries_with_limit(chat_state, create_guest_entries_for_owner(owner, delta))
+            elif delta < 0:
+                remove_latest_guests(chat_state, update.effective_user.id, -delta)
             promotions = rebalance_lists(chat_state)
             record_promotion_stats(chat_state, promotions)
             save_state()
             await reply_in_chat(
                 update,
                 context,
-                f"Обновил запись: теперь {participant_label(existing)} ✅\n\n" + format_list(chat_state),
+                "Обновил количество твоих плюсов ✅\n\n" + format_list(chat_state),
                 chat_state=chat_state,
                 admin=admin,
             )
@@ -1759,21 +1903,25 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if existing_list == "reserve":
         if guest_count > 0:
-            existing = next(
-                participant
-                for participant in chat_state["reserve"]
-                if participant.get("user_id") == update.effective_user.id
-            )
-            existing["guest_count"] = guest_count
+            assert owner is not None
+            delta = guest_count - current_guest_total
+            if delta > 0:
+                chat_state["reserve"].extend(create_guest_entries_for_owner(owner, delta))
+            elif delta < 0:
+                remove_latest_guests(chat_state, update.effective_user.id, -delta)
             promotions = rebalance_lists(chat_state)
             record_promotion_stats(chat_state, promotions)
             save_state()
             current_list_name, _ = find_participant(chat_state, update.effective_user.id)
-            status_text = "Ты уже в основном составе ✅" if current_list_name == "players" else "Обновил запись в резерве ⏳"
+            status_text = (
+                "Ты уже в основном составе ✅"
+                if current_list_name == "players"
+                else "Обновил запись в резерве ⏳"
+            )
             await reply_in_chat(
                 update,
                 context,
-                f"{status_text}: теперь {participant_label(existing)}\n\n" + format_list(chat_state),
+                f"{status_text}\n\n" + format_list(chat_state),
                 chat_state=chat_state,
                 admin=admin,
             )
@@ -1789,16 +1937,18 @@ async def plus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    participant = participant_from_update(update, guest_count=guest_count)
-    group_size = participant_size(participant)
+    participant = participant_from_update(update)
     limit = chat_state.get("limit", 0)
 
-    if limit and total_people(chat_state["players"]) + group_size > limit:
+    if limit and len(chat_state["players"]) >= limit:
         chat_state["reserve"].append(participant)
-        response = "Основа уже заполнена или группа не помещается. Добавил тебя в резерв ⏳\n\n"
+        response = "Основа уже заполнена. Добавил тебя в резерв ⏳\n\n"
     else:
         chat_state["players"].append(participant)
         response = "Записал! ✅\n\n"
+
+    if guest_count > 0:
+        add_entries_with_limit(chat_state, create_guest_entries_for_owner(participant, guest_count))
 
     save_state()
     await reply_in_chat(
@@ -1839,9 +1989,8 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     participant = chat_state[list_name][index]
 
     if action == "guests":
-        current_guests = max(0, int(participant.get("guest_count", 0) or 0))
-        new_guests = max(0, current_guests - count)
-        if new_guests == current_guests:
+        removed = remove_latest_guests(chat_state, update.effective_user.id, count)
+        if removed == 0:
             await reply_in_chat(
                 update,
                 context,
@@ -1851,24 +2000,23 @@ async def minus_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        participant["guest_count"] = new_guests
         promotions = rebalance_lists(chat_state)
         record_promotion_stats(chat_state, promotions)
         save_state()
         await reply_in_chat(
             update,
             context,
-            f"Обновил запись: теперь {participant_label(participant)} ✅\n\n" + format_list(chat_state),
+            "Обновил количество твоих плюсов ✅\n\n" + format_list(chat_state),
             chat_state=chat_state,
             admin=admin,
         )
         await notify_promotions(update.effective_chat.id, context, promotions)
         return
 
-    removed_participant = chat_state[list_name].pop(index)
+    removed_participant, _ = remove_owner_and_guests(chat_state, update.effective_user.id)
     if list_name == "players":
         chat_state["noshow"] = [
-            item for item in chat_state.get("noshow", []) if item != participant_key(removed_participant)
+            item for item in chat_state.get("noshow", []) if item != participant_key(participant)
         ]
     promotions = rebalance_lists(chat_state)
     record_promotion_stats(chat_state, promotions)
