@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -91,6 +92,8 @@ MINUS_PATTERN = re.compile(
 )
 
 state: Dict[str, Dict[str, Any]] = {}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def owner_ids() -> set[int]:
@@ -1444,15 +1447,12 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_state = state[str(update.effective_chat.id)]
     admin = await is_admin(update, context)
     if not admin:
+        if update.effective_message is not None:
+            await update.effective_message.reply_text(
+                "Панель доступна только админам.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
         return
-
-    await reply_in_chat(
-        update,
-        context,
-        "Панель управления:",
-        chat_state=chat_state,
-        admin=admin,
-    )
 
     if update.effective_message is not None:
         await update.effective_message.reply_text(
@@ -2515,6 +2515,9 @@ async def button_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BUTTON_LIST:
         await list_cmd(update, context)
         return
+    if text.lower() in {"меню", "menu", "панель"}:
+        await menu_cmd(update, context)
+        return
 
     if not admin:
         return
@@ -2785,6 +2788,10 @@ async def handle_member_update(update: Update, context: ContextTypes.DEFAULT_TYP
     save_state()
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled Telegram update error", exc_info=context.error)
+
+
 def main():
     load_state()
     token = os.getenv("BOT_TOKEN")
@@ -2802,6 +2809,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_message))
     app.add_handler(ChatMemberHandler(handle_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_error_handler(error_handler)
 
     print("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
