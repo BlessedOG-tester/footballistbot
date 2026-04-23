@@ -15,6 +15,7 @@
 - Умеет хранить недельное расписание игр.
 - Позволяет сохранить до 3 полей и переключать их кнопками.
 - Копит статистику посещений, no-show и резервов после завершённых игр.
+- Может отправлять завершённые игры и отчёты в Google Sheets через Apps Script webhook.
 - Поддерживает рассылку по подключённым чатам через `/broadcast`.
 
 ## Команды
@@ -66,6 +67,13 @@ python bot.py
 ## Переменные окружения
 - `BOT_TOKEN` — токен бота из BotFather.
 - `BOT_OWNER_IDS` — Telegram user id владельца бота или список id через запятую. Только эти id могут использовать `/broadcast`.
+- `GOOGLE_SHEETS_WEBHOOK_URL` — URL веб-приложения Google Apps Script для записи в таблицу.
+
+## Google Sheets
+- Таблица: https://docs.google.com/spreadsheets/d/1LCK7YS9J1hJvLc73Y088liTvZ1KvDNr6TFG-8jePrJQ/edit
+- Вкладки: `Игры`, `Посещаемость`, `Отчёты`.
+- Код Apps Script лежит в `google_sheets_webhook.gs`.
+- Чтобы включить запись из бота: создайте Apps Script для таблицы, вставьте код из `google_sheets_webhook.gs`, задеплойте как Web app и добавьте URL в `GOOGLE_SHEETS_WEBHOOK_URL`.
 
 ## BotFather
 1. Создайте бота через `@BotFather`.

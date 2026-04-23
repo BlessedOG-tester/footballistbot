@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,7 +11,7 @@ from telegram import (
     ChatMember,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatType
@@ -29,6 +32,7 @@ DEFAULT_FIELD = "Горизонт-арена"
 DEFAULT_TIME = "20:00-22:00"
 DEFAULT_TIME_PRESETS = ["18:00-20:00", "20:00-22:00", "21:00-23:00"]
 STATE_FILE = "state.json"
+GOOGLE_SHEETS_WEBHOOK_URL_ENV = "GOOGLE_SHEETS_WEBHOOK_URL"
 
 BUTTON_PLUS = "+"
 BUTTON_MINUS = "-"
@@ -125,6 +129,7 @@ def build_default_state() -> Dict[str, Any]:
             "events_completed": 0,
             "participants": {},
         },
+        "attendance_events": [],
         "schedules": [],
         "active_schedule_id": None,
         "schedule": {
@@ -289,6 +294,8 @@ def normalize_chat_state(chat_state: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(participants_stats, dict):
         participants_stats = {}
     normalized["stats"]["participants"] = participants_stats
+    if not isinstance(normalized.get("attendance_events", []), list):
+        normalized["attendance_events"] = []
     schedule = normalized.get("schedule", {})
     if not isinstance(schedule, dict):
         schedule = {}
@@ -749,6 +756,14 @@ def record_promotion_stats(chat_state: Dict[str, Any], promotions: List[Dict[str
         entry["promotions"] += 1
 
 
+def attendance_person(participant: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "key": participant_key(participant),
+        "display_name": participant.get("display_name", "Игрок"),
+        "username": participant.get("username", ""),
+    }
+
+
 def finalize_event_stats(chat_state: Dict[str, Any]) -> Dict[str, int]:
     players = list(chat_state.get("players", []))
     reserve = list(chat_state.get("reserve", []))
@@ -757,18 +772,25 @@ def finalize_event_stats(chat_state: Dict[str, Any]) -> Dict[str, int]:
     visits = 0
     no_shows = 0
     reserve_only = 0
+    present_people: List[Dict[str, Any]] = []
+    no_show_people: List[Dict[str, Any]] = []
+    reserve_people: List[Dict[str, Any]] = []
+    guest_people: List[str] = []
 
     for participant in players:
         if participant.get("kind") == "guest":
+            guest_people.append(participant_label(participant))
             continue
         entry = ensure_stats_entry(chat_state, participant)
         entry["captured_games"] += 1
         if participant_key(participant) in no_show_keys:
             entry["no_shows"] += 1
             no_shows += 1
+            no_show_people.append(attendance_person(participant))
         else:
             entry["visits"] += 1
             visits += 1
+            present_people.append(attendance_person(participant))
 
     player_keys = {
         participant_key(participant)
@@ -777,14 +799,27 @@ def finalize_event_stats(chat_state: Dict[str, Any]) -> Dict[str, int]:
     }
     for participant in reserve:
         if participant.get("kind") == "guest":
+            guest_people.append(participant_label(participant))
             continue
         if participant_key(participant) in player_keys:
             continue
         entry = ensure_stats_entry(chat_state, participant)
         entry["reserve_games"] += 1
         reserve_only += 1
+        reserve_people.append(attendance_person(participant))
 
     chat_state["stats"]["events_completed"] = int(chat_state["stats"].get("events_completed", 0)) + 1
+    chat_state.setdefault("attendance_events", []).append(
+        {
+            "date": chat_state.get("date"),
+            "time": chat_state.get("time"),
+            "field": chat_state.get("field"),
+            "present": present_people,
+            "no_shows": no_show_people,
+            "reserve": reserve_people,
+            "guests": guest_people,
+        }
+    )
     return {
         "visits": visits,
         "no_shows": no_shows,
@@ -854,6 +889,197 @@ def build_stats_summary(chat_state: Dict[str, Any], query: str = "") -> str:
     for index, entry in enumerate(participants[:10], start=1):
         lines.append(format_stats_line(index, entry))
     return "\n".join(lines)
+
+
+def event_in_report_period(event_date: datetime, period: str, today: Optional[datetime] = None) -> bool:
+    current = today or datetime.now()
+    if period == "all":
+        return True
+    if period == "month":
+        return event_date.year == current.year and event_date.month == current.month
+    if period == "quarter":
+        current_quarter = (current.month - 1) // 3
+        event_quarter = (event_date.month - 1) // 3
+        return event_date.year == current.year and event_quarter == current_quarter
+    if period == "year":
+        return event_date.year == current.year
+    return False
+
+
+def report_period_title(period: str) -> str:
+    return {
+        "month": "за месяц",
+        "quarter": "за квартал",
+        "year": "за год",
+        "all": "за всё время",
+    }.get(period, "")
+
+
+def build_attendance_report(chat_state: Dict[str, Any], period: str) -> str:
+    counters: Dict[str, Dict[str, Any]] = {}
+    games_count = 0
+
+    for event in chat_state.get("attendance_events", []):
+        try:
+            event_date = datetime.strptime(event.get("date", ""), "%d/%m/%y")
+        except ValueError:
+            continue
+        if not event_in_report_period(event_date, period):
+            continue
+
+        games_count += 1
+        for person in event.get("present", []):
+            key = person.get("key") or person.get("display_name")
+            entry = counters.setdefault(
+                key,
+                {
+                    "display_name": person.get("display_name", "Игрок"),
+                    "username": person.get("username", ""),
+                    "visits": 0,
+                    "no_shows": 0,
+                    "reserve": 0,
+                },
+            )
+            entry["visits"] += 1
+
+        for person in event.get("no_shows", []):
+            key = person.get("key") or person.get("display_name")
+            entry = counters.setdefault(
+                key,
+                {
+                    "display_name": person.get("display_name", "Игрок"),
+                    "username": person.get("username", ""),
+                    "visits": 0,
+                    "no_shows": 0,
+                    "reserve": 0,
+                },
+            )
+            entry["no_shows"] += 1
+
+        for person in event.get("reserve", []):
+            key = person.get("key") or person.get("display_name")
+            entry = counters.setdefault(
+                key,
+                {
+                    "display_name": person.get("display_name", "Игрок"),
+                    "username": person.get("username", ""),
+                    "visits": 0,
+                    "no_shows": 0,
+                    "reserve": 0,
+                },
+            )
+            entry["reserve"] += 1
+
+    if not counters:
+        return f"Отчёт {report_period_title(period)} пока пустой. Заверши хотя бы одну игру через меню."
+
+    rows = sorted(
+        counters.values(),
+        key=lambda item: (-item["visits"], item["no_shows"], item["display_name"]),
+    )
+    lines = [f"Посещаемость {report_period_title(period)}", f"Игр учтено: {games_count}", ""]
+    for index, row in enumerate(rows, start=1):
+        username = f" (@{row['username']})" if row.get("username") else ""
+        lines.append(
+            f"{index}. {row['display_name']}{username}: посещений {row['visits']}, no-show {row['no_shows']}, резерв {row['reserve']}"
+        )
+    return "\n".join(lines)
+
+
+def build_attendance_report_rows(chat_state: Dict[str, Any], period: str) -> Tuple[int, List[Dict[str, Any]]]:
+    counters: Dict[str, Dict[str, Any]] = {}
+    games_count = 0
+
+    for event in chat_state.get("attendance_events", []):
+        try:
+            event_date = datetime.strptime(event.get("date", ""), "%d/%m/%y")
+        except ValueError:
+            continue
+        if not event_in_report_period(event_date, period):
+            continue
+
+        games_count += 1
+        for status, key_name in (("present", "visits"), ("no_shows", "no_shows"), ("reserve", "reserve")):
+            for person in event.get(status, []):
+                key = person.get("key") or person.get("display_name")
+                entry = counters.setdefault(
+                    key,
+                    {
+                        "display_name": person.get("display_name", "Игрок"),
+                        "username": person.get("username", ""),
+                        "visits": 0,
+                        "no_shows": 0,
+                        "reserve": 0,
+                    },
+                )
+                entry[key_name] += 1
+
+    rows = sorted(
+        counters.values(),
+        key=lambda item: (-item["visits"], item["no_shows"], item["display_name"]),
+    )
+    return games_count, rows
+
+
+def guest_labels(participants: List[Dict[str, Any]]) -> List[str]:
+    return [participant_label(participant) for participant in participants if participant.get("kind") == "guest"]
+
+
+def post_json_sync(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode("utf-8")
+    if not body:
+        return {"ok": True}
+    return json.loads(body)
+
+
+async def send_to_google_sheets(payload: Dict[str, Any]) -> Tuple[bool, str]:
+    url = os.getenv(GOOGLE_SHEETS_WEBHOOK_URL_ENV, "").strip()
+    if not url:
+        return False, "webhook_not_configured"
+    try:
+        response = await asyncio.to_thread(post_json_sync, url, payload)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return False, str(exc)
+    if response.get("ok") is False:
+        return False, response.get("error", "unknown_error")
+    return True, "ok"
+
+
+async def export_last_event_to_google_sheets(
+    chat_state: Dict[str, Any],
+    chat_id: int,
+    chat_title: str,
+):
+    if not chat_state.get("attendance_events"):
+        return False, "no_event"
+    event = chat_state["attendance_events"][-1]
+    payload = {
+        "action": "event",
+        "chat_id": chat_id,
+        "chat_title": chat_title,
+        "event": event,
+    }
+    return await send_to_google_sheets(payload)
+
+
+async def export_report_to_google_sheets(chat_state: Dict[str, Any], period: str):
+    games_count, rows = build_attendance_report_rows(chat_state, period)
+    payload = {
+        "action": "report",
+        "period": report_period_title(period),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "games_count": games_count,
+        "rows": rows,
+    }
+    return await send_to_google_sheets(payload)
 
 
 def find_participant(chat_state: Dict[str, Any], user_id: int) -> Tuple[Optional[str], Optional[int]]:
@@ -1014,16 +1240,6 @@ async def notify_promotions(
             continue
 
 
-def build_reply_keyboard(chat_state: Dict[str, Any], admin: bool) -> ReplyKeyboardMarkup:
-    if admin:
-        rows: List[List[str]] = [[BUTTON_LIST]]
-        rows.append([BUTTON_OPEN, BUTTON_CLOSE])
-        rows.append([BUTTON_SET_DATETIME, BUTTON_SET_FIELD])
-        rows.append([BUTTON_SHOW_SCHEDULE])
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, selective=True)
-    raise ValueError("Reply keyboard is available only for admins.")
-
-
 def build_admin_panel(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
         [
@@ -1062,6 +1278,12 @@ def build_admin_panel(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
         ]
     )
     rows.append([InlineKeyboardButton("Расписания", callback_data="schedule:hub")])
+    rows.append(
+        [
+            InlineKeyboardButton("Завершить игру", callback_data="action:finish"),
+            InlineKeyboardButton("Статистика", callback_data="report:hub"),
+        ]
+    )
     rows.append([InlineKeyboardButton("Обновить список", callback_data="show:list")])
     return InlineKeyboardMarkup(rows)
 
@@ -1119,6 +1341,21 @@ def build_schedule_detail_markup(index: int) -> InlineKeyboardMarkup:
     )
 
 
+def build_report_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Месяц", callback_data="report:month"),
+                InlineKeyboardButton("Квартал", callback_data="report:quarter"),
+            ],
+            [
+                InlineKeyboardButton("Год", callback_data="report:year"),
+                InlineKeyboardButton("Всё время", callback_data="report:all"),
+            ],
+        ]
+    )
+
+
 def is_service_button_text(text: str, chat_state: Dict[str, Any]) -> bool:
     button_texts = {
         BUTTON_PLUS,
@@ -1151,12 +1388,7 @@ async def reply_in_chat(
     if message is None:
         return
 
-    markup = reply_markup
-    if markup is None and update.effective_chat is not None and chat_state is not None:
-        if admin is None:
-            admin = await is_admin(update, context)
-        if admin:
-            markup = build_reply_keyboard(chat_state, admin)
+    markup = reply_markup if reply_markup is not None else ReplyKeyboardRemove()
 
     await message.reply_text(text, reply_markup=markup)
 
@@ -1169,26 +1401,7 @@ def help_text() -> str:
         "- / минус — выйти из списка\n"
         "Список — показать текущий состав\n\n"
         "Админам:\n"
-        "/open [ДД/ММ/ГГ] [ЧЧ:ММ-ЧЧ:ММ]\n"
-        "/close\n"
-        "/list\n"
-        "/setdate ДД/ММ/ГГ\n"
-        "/settime ЧЧ:ММ-ЧЧ:ММ\n"
-        "/setdatetime ДД/ММ/ГГ ЧЧ:ММ-ЧЧ:ММ\n"
-        "/setfield НАЗВАНИЕ\n"
-        "/setfields Поле 1 | Поле 2 | Поле 3\n"
-        "/schedule [Название | пятница 20:30-22:30 Горизонт-арена|off]\n"
-        "/setlimit N\n"
-        "/remove @username|Имя\n"
-        "/noshow @username|Имя\n"
-        "/showup @username|Имя\n"
-        "/finish\n"
-        "/stats [имя]\n"
-        "/mystats\n"
-        "/reset\n"
-        "/ads on|off\n\n"
-        "Владельцу бота:\n"
-        "/broadcast ТЕКСТ"
+        "/menu — открыть inline-панель управления."
     )
 
 
@@ -1230,16 +1443,18 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     chat_state = state[str(update.effective_chat.id)]
     admin = await is_admin(update, context)
+    if not admin:
+        return
 
     await reply_in_chat(
         update,
         context,
-        "Клавиатура подключена.",
+        "Панель управления:",
         chat_state=chat_state,
         admin=admin,
     )
 
-    if admin and update.effective_message is not None:
+    if update.effective_message is not None:
         await update.effective_message.reply_text(
             "Панель управления записью:",
             reply_markup=build_admin_panel(chat_state),
@@ -2422,6 +2637,44 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data == "show:list":
         pass
+    elif data == "action:finish":
+        if not chat_state["players"] and not chat_state["reserve"]:
+            await query.edit_message_text("Завершать нечего: список пуст.", reply_markup=build_admin_panel(chat_state))
+            return
+        summary = finalize_event_stats(chat_state)
+        sheets_ok, sheets_status = await export_last_event_to_google_sheets(
+            chat_state,
+            update.effective_chat.id,
+            update.effective_chat.title or update.effective_chat.full_name or "",
+        )
+        chat_state["open"] = False
+        chat_state["players"] = []
+        chat_state["reserve"] = []
+        clear_event_marks(chat_state)
+        save_state()
+        sheets_line = ""
+        if os.getenv(GOOGLE_SHEETS_WEBHOOK_URL_ENV, "").strip():
+            sheets_line = "\nGoogle Sheets: записано ✅" if sheets_ok else f"\nGoogle Sheets: ошибка ({sheets_status})"
+        await query.edit_message_text(
+            "Игра завершена и записана в статистику ✅\n\n"
+            f"Посещений: {summary['visits']}\n"
+            f"No-show: {summary['no_shows']}\n"
+            f"Остались в резерве: {summary['reserve_only']}"
+            f"{sheets_line}",
+            reply_markup=build_admin_panel(chat_state),
+        )
+        return
+    elif data == "report:hub":
+        await query.edit_message_text("Выбери период отчёта:", reply_markup=build_report_markup())
+        return
+    elif data.startswith("report:"):
+        period = data.split(":", 1)[1]
+        report_text = build_attendance_report(chat_state, period)
+        sheets_ok, sheets_status = await export_report_to_google_sheets(chat_state, period)
+        if os.getenv(GOOGLE_SHEETS_WEBHOOK_URL_ENV, "").strip():
+            report_text += "\n\nGoogle Sheets: записано ✅" if sheets_ok else f"\n\nGoogle Sheets: ошибка ({sheets_status})"
+        await query.edit_message_text(report_text, reply_markup=build_report_markup())
+        return
     elif data == "schedule:hub":
         await query.edit_message_text(
             "Расписания:",
@@ -2543,27 +2796,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("open", open_cmd))
-    app.add_handler(CommandHandler("setdate", setdate_cmd))
-    app.add_handler(CommandHandler("settime", settime_cmd))
-    app.add_handler(CommandHandler("setdatetime", setdatetime_cmd))
-    app.add_handler(CommandHandler("setfield", setfield_cmd))
-    app.add_handler(CommandHandler("setfields", setfields_cmd))
-    app.add_handler(CommandHandler("schedule", schedule_cmd))
-    app.add_handler(CommandHandler("setlimit", setlimit_cmd))
-    app.add_handler(CommandHandler("remove", remove_cmd))
-    app.add_handler(CommandHandler("noshow", noshow_cmd))
-    app.add_handler(CommandHandler("showup", showup_cmd))
-    app.add_handler(CommandHandler("finish", finish_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("mystats", mystats_cmd))
-    app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(CommandHandler("close", close_cmd))
-    app.add_handler(CommandHandler("ads", ads_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(date|time|field|toggle|show|prompt|schedule):"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(date|time|field|toggle|show|prompt|schedule|action|report):"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_PATTERN), plus_message))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_PATTERN), minus_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_message))
