@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -59,8 +60,13 @@ PLUS_RE = re.compile(r"^\s*\+\s*(?P<count>[1-5])?\s*$")
 MINUS_RE = re.compile(r"^\s*(?:-\s*(?P<count>[1-5])?|минус|не\s+смогу|не\s+буду)\s*$", re.IGNORECASE)
 MENU_WORDS = {"меню", "menu", "панель"}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("footballistbot")
 
 state: Dict[str, Dict[str, Any]] = {}
