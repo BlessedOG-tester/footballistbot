@@ -921,6 +921,18 @@ async def refresh_list_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     return msg
 
 
+async def post_list_update(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    chat_state: Dict[str, Any],
+    message: Message,
+    header: str,
+) -> None:
+    """After a player's action: keep the pinned list current and reply with a fresh copy of the list."""
+    await refresh_list_message(context, chat_id, chat_state)
+    await message.reply_text(header + "\n\n" + format_game(chat_state))
+
+
 async def react(message: Message, emoji: str) -> bool:
     try:
         await message.set_reaction(emoji)
@@ -991,6 +1003,10 @@ async def plus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     elif result["joined"] == "reserve":
         position = find_player(chat_state["reserve"], user.id)
         notes.append(f"Основа заполнена — ты в резерве под №{(position or 0) + 1}. Если кто-то выйдет, подниму тебя автоматически.")
+    elif result["joined"] == "main":
+        notes.append("Записал ✅")
+    if result["guests_added"]:
+        notes.append(f"Гостей добавил: {result['guests_added']}.")
     if result["reserve_added"]:
         notes.append(f"Гости в резерве: {result['reserve_added']}.")
     if result["guests_removed"]:
@@ -999,9 +1015,7 @@ async def plus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     changed = result["joined"] is not None or result["guests_added"] or result["guests_removed"]
     if changed:
         await react(message, ReactionEmoji.THUMBS_UP)
-        await refresh_list_message(context, update.effective_chat.id, chat_state)
-    if notes:
-        await message.reply_text(" ".join(notes))
+    await post_list_update(context, update.effective_chat.id, chat_state, message, " ".join(notes))
     await announce_promotions(context, update.effective_chat.id, result["promoted"])
 
 
@@ -1026,7 +1040,8 @@ async def minus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await react(message, ReactionEmoji.THUMBS_UP)
-    await refresh_list_message(context, update.effective_chat.id, chat_state)
+    header = f"Убрал гостей: {result['guests_removed']} ✅" if guests else "Убрал тебя из списка ✅"
+    await post_list_update(context, update.effective_chat.id, chat_state, message, header)
     await announce_promotions(context, update.effective_chat.id, result["promoted"])
 
 
