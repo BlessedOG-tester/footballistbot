@@ -1,12 +1,12 @@
 """Telegram bot for weekly football sign-up lists.
 
 Players write "+" / "+N" / "-" / "-N" in a group chat, the bot keeps the main
-list and the reserve list, promotes from the reserve automatically and keeps a
-single list message up to date. Admins manage the game with commands or the
-inline panel (/menu).
+list and the reserve list, promotes from the reserve automatically and replies
+with the current list after every action. After the game is finished the bot
+keeps track of who took the bibs home to wash ("я взял"). Admins manage the
+game with commands or the inline panel (/menu).
 """
 
-import asyncio
 import html
 import json
 import logging
@@ -14,8 +14,6 @@ import os
 import re
 import sys
 import tempfile
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,14 +49,21 @@ DEFAULT_END = os.getenv("DEFAULT_END", "22:30")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "18"))
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))
 TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-GOOGLE_SHEETS_WEBHOOK_URL_ENV = "GOOGLE_SHEETS_WEBHOOK_URL"
 MAX_GUESTS = 5
 WINNERS_PROMPT_DELAY = timedelta(hours=1)
 GROUP_ANONYMOUS_BOT_ID = 1087968824
 
 PLUS_RE = re.compile(r"^\s*\+\s*(?P<count>[1-5])?\s*$")
 MINUS_RE = re.compile(r"^\s*(?:-\s*(?P<count>[1-5])?|минус|не\s+смогу|не\s+буду)\s*$", re.IGNORECASE)
+# "я взял", "взял", "беру", "я забрал манишки", "манишки у меня", "взял манишки стирать"
+BIBS_TAKE_RE = re.compile(
+    r"^\s*(?:я\s+)?(?:взял|взяла|беру|забрал|забрала|забираю|заберу|возьму)"
+    r"(?:\s+манишки)?(?:\s+(?:домой|стирать|постирать))*\s*[!.)]*\s*$"
+    r"|^\s*манишки\s+(?:у\s+меня|взял|беру|забрал)\s*[!.)]*\s*$",
+    re.IGNORECASE,
+)
 MENU_WORDS = {"меню", "menu", "панель"}
+BIBS_WORDS = {"манишки", "манишка"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -164,10 +169,7 @@ def roll_date_forward(game: Dict[str, Any], weeks: int = 1) -> None:
 
 
 def roll_date_to_future(game: Dict[str, Any]) -> bool:
-    """If the game date is in the past, move it forward week by week until it is not.
-
-    Returns True if the date was changed.
-    """
+    """If the game date is in the past, move it forward week by week until it is not."""
     date = game_date(game)
     if date is None:
         game["date"] = today_str()
@@ -204,7 +206,16 @@ def default_game() -> Dict[str, Any]:
         "was_opened": False,  # set when the list is opened; gates the winners reminder
         "reminder_sent": False,
         "winners_prompt_message_id": None,
-        "list_message_id": None,  # the single list message the bot keeps editing
+        "list_message_id": None,  # the pinned list message the bot keeps editing
+    }
+
+
+def default_bibs() -> Dict[str, Any]:
+    return {
+        "active": False,  # True between /finish and the admin's reset
+        "takers": [],  # [{user_id, name, username, taken_at}]
+        "message_id": None,  # the bibs message the bot keeps editing
+        "game_date": "",  # the game after which this round started
     }
 
 
@@ -216,7 +227,7 @@ def default_chat_state(chat_title: str = "", chat_type: str = "") -> Dict[str, A
         "game": default_game(),
         "players": [],
         "reserve": [],
-        "history": [],
+        "bibs": default_bibs(),
     }
 
 
@@ -231,7 +242,6 @@ def normalize_entry(item: Any) -> Optional[Dict[str, Any]]:
             "owner_name": item,
             "owner_username": "",
             "joined_at": "",
-            "no_show": False,
         }
     if not isinstance(item, dict):
         return None
@@ -245,7 +255,6 @@ def normalize_entry(item: Any) -> Optional[Dict[str, Any]]:
         "owner_name": item.get("owner_name") or item.get("owner_display_name") or item.get("name") or "",
         "owner_username": item.get("owner_username") or (item.get("username") or "" if kind == "player" else ""),
         "joined_at": item.get("joined_at", ""),
-        "no_show": bool(item.get("no_show", False)),
     }
 
 
@@ -258,6 +267,27 @@ def normalize_players(raw_players: Any) -> List[Dict[str, Any]]:
         if entry is not None:
             result.append(entry)
     return result
+
+
+def normalize_bibs(raw: Any) -> Dict[str, Any]:
+    bibs = default_bibs()
+    if isinstance(raw, dict):
+        bibs["active"] = bool(raw.get("active", False))
+        bibs["message_id"] = raw.get("message_id")
+        bibs["game_date"] = raw.get("game_date", "") or ""
+        takers = raw.get("takers", [])
+        if isinstance(takers, list):
+            for item in takers:
+                if isinstance(item, dict) and (item.get("user_id") or item.get("name")):
+                    bibs["takers"].append(
+                        {
+                            "user_id": item.get("user_id"),
+                            "name": item.get("name") or "",
+                            "username": item.get("username") or "",
+                            "taken_at": item.get("taken_at") or "",
+                        }
+                    )
+    return bibs
 
 
 def normalize_chat(chat_state: Any) -> Dict[str, Any]:
@@ -292,8 +322,8 @@ def normalize_chat(chat_state: Any) -> Dict[str, Any]:
 
     normalized["players"] = normalize_players(normalized.get("players", []))
     normalized["reserve"] = normalize_players(normalized.get("reserve", []))
-    if not isinstance(normalized.get("history"), list):
-        normalized["history"] = []
+    normalized["bibs"] = normalize_bibs(normalized.get("bibs"))
+    normalized.pop("history", None)  # attendance statistics were dropped
     return normalized
 
 
@@ -364,7 +394,6 @@ def make_player(user: User) -> Dict[str, Any]:
         "owner_name": full_name(user),
         "owner_username": user.username or "",
         "joined_at": now_iso(),
-        "no_show": False,
     }
 
 
@@ -378,7 +407,6 @@ def make_guest(user: User) -> Dict[str, Any]:
         "owner_name": full_name(user),
         "owner_username": user.username or "",
         "joined_at": now_iso(),
-        "no_show": False,
     }
 
 
@@ -390,8 +418,7 @@ def player_label(entry: Dict[str, Any]) -> str:
         return f"+1 от {owner}{suffix}"
     username = entry.get("username", "")
     suffix = f" (@{username})" if username else ""
-    mark = " ❌" if entry.get("no_show") else ""
-    return f"{entry.get('name') or 'Игрок'}{suffix}{mark}"
+    return f"{entry.get('name') or 'Игрок'}{suffix}"
 
 
 def mention_html(entry: Dict[str, Any]) -> str:
@@ -432,10 +459,7 @@ def total_guests(chat_state: Dict[str, Any], user_id: int) -> int:
 
 
 def add_entry(chat_state: Dict[str, Any], entry: Dict[str, Any]) -> str:
-    """Append an entry to the main list, or to the reserve if the main list is full.
-
-    Returns "main" or "reserve".
-    """
+    """Append an entry to the main list, or to the reserve if the main list is full."""
     if is_full(chat_state):
         chat_state["reserve"].append(entry)
         return "reserve"
@@ -527,17 +551,72 @@ def find_entry_by_query(chat_state: Dict[str, Any], query: str) -> Optional[Tupl
         return None
     for list_name in ("players", "reserve"):
         for index, entry in enumerate(chat_state[list_name]):
-            if entry.get("kind") != "player":
-                continue
-            if (entry.get("username") or "").lower() == q:
+            if entry.get("kind") == "player" and (entry.get("username") or "").lower() == q:
                 return list_name, index
     for list_name in ("players", "reserve"):
         for index, entry in enumerate(chat_state[list_name]):
-            if entry.get("kind") != "player":
-                continue
-            if q in (entry.get("name") or "").lower():
+            if entry.get("kind") == "player" and q in (entry.get("name") or "").lower():
                 return list_name, index
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Bibs (манишки)
+# --------------------------------------------------------------------------- #
+
+
+def start_bibs_round(chat_state: Dict[str, Any], game_date_text: str) -> None:
+    """Called on /finish: a new round of 'who took the bibs' starts, the old list is dropped."""
+    chat_state["bibs"] = default_bibs()
+    chat_state["bibs"]["active"] = True
+    chat_state["bibs"]["game_date"] = game_date_text
+
+
+def add_bibs_taker(chat_state: Dict[str, Any], user: User) -> bool:
+    """Record that the user took the bibs. Returns False if already recorded."""
+    bibs = chat_state["bibs"]
+    if any(t.get("user_id") == user.id for t in bibs["takers"]):
+        return False
+    bibs["takers"].append(
+        {"user_id": user.id, "name": full_name(user), "username": user.username or "", "taken_at": now_iso()}
+    )
+    return True
+
+
+def remove_bibs_taker(chat_state: Dict[str, Any], user_id: int) -> bool:
+    bibs = chat_state["bibs"]
+    before = len(bibs["takers"])
+    bibs["takers"] = [t for t in bibs["takers"] if t.get("user_id") != user_id]
+    return len(bibs["takers"]) != before
+
+
+def format_bibs(chat_state: Dict[str, Any]) -> str:
+    bibs = chat_state["bibs"]
+    date_text = f" после игры {bibs['game_date']}" if bibs.get("game_date") else ""
+    if bibs["takers"]:
+        rows = []
+        for i, t in enumerate(bibs["takers"], start=1):
+            username = f" (@{t['username']})" if t.get("username") else ""
+            rows.append(f"{i}. {t['name']}{username}")
+        body = "\n".join(rows)
+    else:
+        body = "Пока никто не отметился."
+    return (
+        f"🧺 Манишки{date_text}\n"
+        "Кто забрал манишки стирать — напиши «я взял».\n\n"
+        f"Взяли стирать:\n{body}"
+    )
+
+
+def bibs_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Обновить список (манишки вернули)", callback_data="admin:bibs_reset"),
+            ],
+            [InlineKeyboardButton("« Назад", callback_data="admin:back")],
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -581,7 +660,8 @@ def help_text() -> str:
         "+1…+5 — записаться с гостями (число = сколько гостей)\n"
         "-1…-5 — убрать часть гостей\n"
         "/list — показать список\n"
-        "/mystats — моя статистика\n\n"
+        "«я взял» — после игры отметить, что забрал манишки стирать\n"
+        "/bibs или слово «манишки» — у кого сейчас манишки\n\n"
         "Если основа заполнена, попадаешь в резерв. Когда кто-то выходит, "
         "первый из резерва поднимается автоматически, бот напишет об этом.\n\n"
         "Админам: /menu — панель, /admin — список команд."
@@ -601,11 +681,11 @@ def admin_help_text() -> str:
         "/setlimit N — лимит мест (0 = без лимита)\n"
         "/add Имя — добавить игрока вручную\n"
         "/remove @username|Имя|№ — убрать игрока\n"
-        "/noshow @username|Имя|№ — отметить, что не пришёл\n"
-        "/showup @username|Имя|№ — снять отметку no-show\n"
-        "/finish — завершить игру, записать статистику, перенести дату на неделю\n"
-        "/stats [month|quarter|year|all] [Имя] — статистика\n"
-        "/reset — очистить список\n"
+        "/finish — завершить игру: очистить список, перенести дату на неделю и открыть учёт манишек\n"
+        "/bibs — список, кто взял манишки\n"
+        "/bibs reset — обновить список манишек (манишки вернули)\n"
+        "/bibs remove @username|Имя — убрать человека из списка манишек\n"
+        "/reset — очистить список игроков\n"
         "/menu — inline-панель"
     )
 
@@ -631,7 +711,7 @@ def admin_keyboard(chat_state: Dict[str, Any]) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("🏁 Завершить игру", callback_data="admin:finish"),
-                InlineKeyboardButton("📊 Статистика", callback_data="admin:stats"),
+                InlineKeyboardButton("🧺 Манишки", callback_data="admin:bibs"),
             ],
             [InlineKeyboardButton("🗑 Очистить список", callback_data="admin:reset")],
         ]
@@ -649,207 +729,6 @@ def confirm_keyboard(action: str) -> InlineKeyboardMarkup:
     )
 
 
-def stats_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Месяц", callback_data="stats:month"),
-                InlineKeyboardButton("Квартал", callback_data="stats:quarter"),
-            ],
-            [
-                InlineKeyboardButton("Год", callback_data="stats:year"),
-                InlineKeyboardButton("Всё время", callback_data="stats:all"),
-            ],
-            [InlineKeyboardButton("« Назад", callback_data="admin:back")],
-        ]
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Statistics and Google Sheets
-# --------------------------------------------------------------------------- #
-
-
-def person_row(entry: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "key": f"user:{entry['user_id']}" if entry.get("user_id") else f"name:{entry.get('name', '')}",
-        "display_name": entry.get("name", ""),
-        "username": entry.get("username", ""),
-    }
-
-
-def build_event(chat_state: Dict[str, Any]) -> Dict[str, Any]:
-    game = chat_state["game"]
-    players = [p for p in chat_state["players"] if p.get("kind") == "player"]
-    return {
-        "date": game["date"],
-        "time": f"{game['start']}-{game['end']}",
-        "field": game["field"],
-        "present": [person_row(p) for p in players if not p.get("no_show")],
-        "no_shows": [person_row(p) for p in players if p.get("no_show")],
-        "reserve": [person_row(p) for p in chat_state["reserve"] if p.get("kind") == "player"],
-        "guests": [player_label(p) for p in chat_state["players"] if p.get("kind") == "guest"],
-        "finished_at": now_iso(),
-    }
-
-
-def finish_game(chat_state: Dict[str, Any]) -> Dict[str, Any]:
-    """Record the game into history, clear the lists, roll the date one week forward."""
-    event = build_event(chat_state)
-    chat_state["history"].append(event)
-    chat_state["players"] = []
-    chat_state["reserve"] = []
-    game = chat_state["game"]
-    game["open"] = False
-    game["list_message_id"] = None
-    roll_date_forward(game)
-    game["was_opened"] = False
-    game["reminder_sent"] = False
-    game["winners_prompt_message_id"] = None
-    return event
-
-
-def in_period(date_text: str, period: str) -> bool:
-    try:
-        event_date = datetime.strptime(date_text, "%d/%m/%y")
-    except ValueError:
-        return False
-    now = today()
-    if period == "all":
-        return True
-    if period == "month":
-        return (event_date.year, event_date.month) == (now.year, now.month)
-    if period == "year":
-        return event_date.year == now.year
-    if period == "quarter":
-        return event_date.year == now.year and (event_date.month - 1) // 3 == (now.month - 1) // 3
-    return False
-
-
-def period_title(period: str) -> str:
-    return {"month": "за месяц", "quarter": "за квартал", "year": "за год", "all": "за всё время"}.get(period, "")
-
-
-def build_stats(chat_state: Dict[str, Any], period: str) -> Tuple[str, List[Dict[str, Any]], int]:
-    counters: Dict[str, Dict[str, Any]] = {}
-    games = 0
-
-    def row_for(person: Dict[str, Any]) -> Dict[str, Any]:
-        key = person.get("key") or person.get("display_name")
-        return counters.setdefault(
-            key,
-            {
-                "display_name": person.get("display_name") or "Игрок",
-                "username": person.get("username", ""),
-                "visits": 0,
-                "no_shows": 0,
-                "reserve": 0,
-            },
-        )
-
-    for event in chat_state.get("history", []):
-        if not in_period(event.get("date", ""), period):
-            continue
-        games += 1
-        for person in event.get("present", []):
-            row_for(person)["visits"] += 1
-        for person in event.get("no_shows", []):
-            row_for(person)["no_shows"] += 1
-        for person in event.get("reserve", []):
-            row_for(person)["reserve"] += 1
-
-    rows = sorted(counters.values(), key=lambda r: (-r["visits"], r["no_shows"], r["display_name"]))
-    if not rows:
-        return f"Статистика {period_title(period)} пока пустая.", [], games
-
-    lines = [f"📊 Посещаемость {period_title(period)}", f"Игр учтено: {games}", ""]
-    for index, row in enumerate(rows, start=1):
-        username = f" (@{row['username']})" if row.get("username") else ""
-        extra = []
-        if row["no_shows"]:
-            extra.append(f"no-show {row['no_shows']}")
-        if row["reserve"]:
-            extra.append(f"резерв {row['reserve']}")
-        extra_text = f" · {', '.join(extra)}" if extra else ""
-        lines.append(f"{index}. {row['display_name']}{username}: {row['visits']}{extra_text}")
-    return "\n".join(lines), rows, games
-
-
-def player_stats_text(chat_state: Dict[str, Any], user_id: Optional[int], name_query: str = "") -> str:
-    visits = no_shows = reserve = 0
-    display = ""
-    q = name_query.strip().lstrip("@").lower()
-    for event in chat_state.get("history", []):
-        for bucket, attr in (("present", "visits"), ("no_shows", "no_shows"), ("reserve", "reserve")):
-            for person in event.get(bucket, []):
-                matches = (user_id is not None and person.get("key") == f"user:{user_id}") or (
-                    q and (q == (person.get("username") or "").lower() or q in (person.get("display_name") or "").lower())
-                )
-                if matches:
-                    display = display or person.get("display_name", "")
-                    if attr == "visits":
-                        visits += 1
-                    elif attr == "no_shows":
-                        no_shows += 1
-                    else:
-                        reserve += 1
-    if not display:
-        return "Статистики пока нет."
-    return f"📊 {display}\nПосещений: {visits}\nNo-show: {no_shows}\nОставался в резерве: {reserve}"
-
-
-def post_json_sync(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        body = response.read().decode("utf-8")
-    return json.loads(body) if body else {"ok": True}
-
-
-def sheets_configured() -> bool:
-    return bool(os.getenv(GOOGLE_SHEETS_WEBHOOK_URL_ENV, "").strip())
-
-
-async def send_to_sheets(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    url = os.getenv(GOOGLE_SHEETS_WEBHOOK_URL_ENV, "").strip()
-    if not url:
-        return False, "not_configured"
-    try:
-        response = await asyncio.to_thread(post_json_sync, url, payload)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        logger.warning("Google Sheets export failed: %s", exc)
-        return False, str(exc)
-    if isinstance(response, dict) and response.get("ok") is False:
-        return False, str(response.get("error", "unknown_error"))
-    return True, "ok"
-
-
-async def export_event(event: Dict[str, Any], chat_id: int, chat_title: str) -> Tuple[bool, str]:
-    return await send_to_sheets({"action": "event", "chat_id": chat_id, "chat_title": chat_title, "event": event})
-
-
-async def export_stats(period: str, rows: List[Dict[str, Any]], games: int) -> Tuple[bool, str]:
-    return await send_to_sheets(
-        {
-            "action": "report",
-            "period": period_title(period),
-            "generated_at": today().strftime("%Y-%m-%d %H:%M:%S"),
-            "games_count": games,
-            "rows": rows,
-        }
-    )
-
-
-def sheets_note(ok: bool, status: str) -> str:
-    if not sheets_configured():
-        return ""
-    return "\nGoogle Sheets: записано ✅" if ok else f"\nGoogle Sheets: ошибка ({status})"
-
-
 # --------------------------------------------------------------------------- #
 # Telegram helpers
 # --------------------------------------------------------------------------- #
@@ -864,7 +743,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if chat is None or user is None:
         return False
-    # Admins posting anonymously on behalf of the group.
     message = update.effective_message
     if message is not None and message.sender_chat is not None and message.sender_chat.id == chat.id:
         return True
@@ -895,21 +773,28 @@ def chat_state_for(update: Update) -> Dict[str, Any]:
     return ensure_chat(chat.id, chat.title or chat.full_name or "", chat.type)
 
 
+async def edit_or_ignore(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Optional[int], text: str, reply_markup=None) -> bool:
+    """Edit a message the bot sent earlier; returns False if it could not be edited."""
+    if not message_id:
+        return False
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        return True
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return True
+        logger.info("Message %s in %s could not be edited: %s", message_id, chat_id, exc)
+    except TelegramError as exc:
+        logger.warning("Message edit failed in %s: %s", chat_id, exc)
+    return False
+
+
 async def refresh_list_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any], force_new: bool = False) -> Optional[Message]:
-    """Keep a single list message up to date: edit it if possible, otherwise send a fresh one."""
+    """Keep the pinned list message up to date: edit it if possible, otherwise send a fresh one."""
     game = chat_state["game"]
     text = format_game(chat_state)
-    message_id = game.get("list_message_id")
-    if message_id and not force_new:
-        try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-            return None
-        except BadRequest as exc:
-            if "not modified" in str(exc).lower():
-                return None
-            logger.info("List message %s in %s could not be edited (%s), sending new one", message_id, chat_id, exc)
-        except TelegramError as exc:
-            logger.warning("List message edit failed in %s: %s", chat_id, exc)
+    if not force_new and await edit_or_ignore(context, chat_id, game.get("list_message_id"), text):
+        return None
     msg = await context.bot.send_message(chat_id=chat_id, text=text)
     game["list_message_id"] = msg.message_id
     if game.get("open"):
@@ -921,16 +806,22 @@ async def refresh_list_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     return msg
 
 
-async def post_list_update(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    chat_state: Dict[str, Any],
-    message: Message,
-    header: str,
-) -> None:
+async def post_list_update(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any], message: Message, header: str) -> None:
     """After a player's action: keep the pinned list current and reply with a fresh copy of the list."""
     await refresh_list_message(context, chat_id, chat_state)
     await message.reply_text(header + "\n\n" + format_game(chat_state))
+
+
+async def post_bibs_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any]) -> Message:
+    """Send a fresh bibs message and remember it for later edits."""
+    msg = await context.bot.send_message(chat_id=chat_id, text=format_bibs(chat_state))
+    chat_state["bibs"]["message_id"] = msg.message_id
+    save_state()
+    return msg
+
+
+async def refresh_bibs_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any]) -> None:
+    await edit_or_ignore(context, chat_id, chat_state["bibs"].get("message_id"), format_bibs(chat_state))
 
 
 async def react(message: Message, emoji: str) -> bool:
@@ -952,7 +843,6 @@ async def announce_promotions(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         else:
             lines.append(f"{mention_html(entry)}, ты в игре! Приходи! ⚽️")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML)
-    # Also try to notify in private (works only if the user has started the bot).
     for entry in promoted:
         if entry.get("kind") != "player" or not entry.get("user_id"):
             continue
@@ -1045,12 +935,37 @@ async def minus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await announce_promotions(context, update.effective_chat.id, result["promoted"])
 
 
+async def bibs_take_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Someone wrote 'я взял' — record them as holding the bibs."""
+    if not is_group(update) or update.effective_user is None or update.message is None:
+        return
+    chat_state = chat_state_for(update)
+    message = update.message
+    user = update.effective_user
+    bibs = chat_state["bibs"]
+    if not bibs.get("active"):
+        # No round is open (e.g. before the first /finish). Start one so the note is not lost.
+        start_bibs_round(chat_state, chat_state["game"].get("date", ""))
+        bibs = chat_state["bibs"]
+    added = add_bibs_taker(chat_state, user)
+    save_state()
+    if not added:
+        await message.reply_text("Ты уже в списке манишек 🧺")
+        return
+    await react(message, ReactionEmoji.THUMBS_UP)
+    await refresh_bibs_message(context, update.effective_chat.id, chat_state)
+    await message.reply_text(f"Записал: {full_name(user)} забрал манишки стирать 🧺\n\n" + format_bibs(chat_state))
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.message is None:
         return
-    text = (update.message.text or "").strip().lower()
+    text = (update.message.text or "").strip().lower().rstrip("?!.")
     if text in MENU_WORDS:
         await menu_cmd(update, context)
+        return
+    if text in BIBS_WORDS:
+        await bibs_cmd(update, context)
         return
 
     reply_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
@@ -1292,80 +1207,76 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await announce_promotions(context, update.effective_chat.id, promoted)
 
 
-async def _mark_noshow(update: Update, context: ContextTypes.DEFAULT_TYPE, value: bool) -> None:
-    if not await require_admin(update, context):
-        return
-    query = " ".join(context.args or []).strip()
-    if not query:
-        await update.message.reply_text("Укажи игрока: @username, имя или номер в списке")
-        return
-    chat_state = chat_state_for(update)
-    found = find_entry_by_query(chat_state, query)
-    if found is None or found[0] != "players":
-        await update.message.reply_text("Не нашёл такого игрока в основе.")
-        return
-    entry = chat_state["players"][found[1]]
-    entry["no_show"] = value
+def finish_game(chat_state: Dict[str, Any]) -> str:
+    """Clear the lists, roll the date one week forward and open a new bibs round. Returns the finished game's date."""
+    game = chat_state["game"]
+    finished_date = game["date"]
+    chat_state["players"] = []
+    chat_state["reserve"] = []
+    game["open"] = False
+    game["list_message_id"] = None
+    roll_date_forward(game)
+    game["was_opened"] = False
+    game["reminder_sent"] = False
+    game["winners_prompt_message_id"] = None
+    start_bibs_round(chat_state, finished_date)
+    return finished_date
+
+
+async def do_finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any]) -> str:
+    finish_game(chat_state)
     save_state()
-    label = player_label({**entry, "no_show": False})
-    await update.message.reply_text(f"{label}: {'отмечен как no-show ❌' if value else 'отметка no-show снята ✅'}")
-    await refresh_list_message(context, update.effective_chat.id, chat_state)
-
-
-async def noshow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _mark_noshow(update, context, True)
-
-
-async def showup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _mark_noshow(update, context, False)
-
-
-async def do_finish(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_title: str, chat_state: Dict[str, Any]) -> str:
-    event = finish_game(chat_state)
-    save_state()
-    ok, status = await export_event(event, chat_id, chat_title)
-    text = (
-        "Игра завершена ✅\n"
-        f"Пришли: {len(event['present'])}\n"
-        f"No-show: {len(event['no_shows'])}\n"
-        f"Остались в резерве: {len(event['reserve'])}\n"
-        f"Гостей: {len(event['guests'])}\n"
+    await post_bibs_message(context, chat_id, chat_state)
+    return (
+        "Игра завершена ✅ Список очищен.\n"
         f"Следующая игра: {date_label(chat_state['game'])} — открыть запись: /open"
     )
-    return text + sheets_note(ok, status)
 
 
 async def finish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
     chat_state = chat_state_for(update)
-    if not chat_state["players"]:
+    if not chat_state["players"] and not chat_state["reserve"]:
         await update.message.reply_text("Список пуст, завершать нечего.")
         return
-    chat = update.effective_chat
-    await update.message.reply_text(await do_finish(context, chat.id, chat.title or "", chat_state))
+    await update.message.reply_text(await do_finish(context, update.effective_chat.id, chat_state))
 
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bibs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bibs — show who has the bibs; /bibs reset and /bibs remove X are for admins."""
     if not is_group(update) or update.message is None:
         return
     chat_state = chat_state_for(update)
     args = list(context.args or [])
-    period = "all"
-    if args and args[0].lower() in ("month", "quarter", "year", "all"):
-        period = args.pop(0).lower()
-    if args:
-        await update.message.reply_text(player_stats_text(chat_state, None, " ".join(args)))
-        return
-    text, rows, games = build_stats(chat_state, period)
-    await update.message.reply_text(text)
+    sub = args[0].lower() if args else ""
 
-
-async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group(update) or update.message is None or update.effective_user is None:
+    if sub in ("reset", "сброс", "обновить", "new"):
+        if not await require_admin(update, context):
+            return
+        start_bibs_round(chat_state, "")
+        save_state()
+        await post_bibs_message(context, update.effective_chat.id, chat_state)
         return
-    chat_state = chat_state_for(update)
-    await update.message.reply_text(player_stats_text(chat_state, update.effective_user.id))
+
+    if sub in ("remove", "убрать", "del"):
+        if not await require_admin(update, context):
+            return
+        q = " ".join(args[1:]).strip().lstrip("@").lower()
+        takers = chat_state["bibs"]["takers"]
+        target = next((t for t in takers if (t.get("username") or "").lower() == q), None) or next(
+            (t for t in takers if q and q in (t.get("name") or "").lower()), None
+        )
+        if target is None:
+            await update.message.reply_text("Не нашёл такого в списке манишек.")
+            return
+        remove_bibs_taker(chat_state, target["user_id"])
+        save_state()
+        await refresh_bibs_message(context, update.effective_chat.id, chat_state)
+        await update.message.reply_text(f"Убрал {target['name']} из списка манишек ✅\n\n" + format_bibs(chat_state))
+        return
+
+    await post_bibs_message(context, update.effective_chat.id, chat_state)
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1376,7 +1287,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Список уже пуст.")
         return
     await update.message.reply_text(
-        "Очистить список без записи статистики? (для завершения игры с учётом статистики используй /finish)",
+        "Очистить список игроков? (чтобы завершить игру и открыть учёт манишек, используй /finish)",
         reply_markup=confirm_keyboard("reset"),
     )
 
@@ -1408,6 +1319,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if "not modified" not in str(exc).lower():
                 raise
 
+    async def show_bibs(prefix: str = "") -> None:
+        text = (prefix + "\n\n" if prefix else "") + format_bibs(chat_state)
+        try:
+            await query.edit_message_text(text, reply_markup=bibs_keyboard())
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+
     if data in ("admin:back", "admin:list"):
         await show_panel()
     elif data == "admin:open":
@@ -1434,28 +1353,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         msg = await query.message.reply_text("Ответь на это сообщение лимитом участников, например: 18 (0 = без лимита)")
         set_prompt(context, chat.id, "limit", msg.message_id)
     elif data == "admin:finish":
-        if not chat_state["players"]:
+        if not chat_state["players"] and not chat_state["reserve"]:
             await show_panel("Список пуст, завершать нечего.")
             return
         await query.edit_message_text(
-            "Завершить игру? Статистика запишется, список очистится, дата перенесётся на неделю вперёд.\n\n"
-            "Перед этим отметь тех, кто не пришёл: /noshow @username",
+            "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, "
+            "бот спросит, кто забрал манишки.",
             reply_markup=confirm_keyboard("finish"),
         )
     elif data == "confirm:finish":
-        if not chat_state["players"]:
+        if not chat_state["players"] and not chat_state["reserve"]:
             await show_panel("Список пуст, завершать нечего.")
             return
-        text = await do_finish(context, chat.id, chat.title or "", chat_state)
+        text = await do_finish(context, chat.id, chat_state)
         await show_panel(text)
     elif data == "admin:reset":
         if not chat_state["players"] and not chat_state["reserve"]:
             await show_panel("Список уже пуст.")
             return
-        await query.edit_message_text(
-            "Очистить список без записи статистики?",
-            reply_markup=confirm_keyboard("reset"),
-        )
+        await query.edit_message_text("Очистить список игроков?", reply_markup=confirm_keyboard("reset"))
     elif data == "confirm:reset":
         chat_state["players"] = []
         chat_state["reserve"] = []
@@ -1463,19 +1379,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if game.get("list_message_id"):
             await refresh_list_message(context, chat.id, chat_state)
         await show_panel("Список очищен 🗑")
-    elif data == "admin:stats":
-        await query.edit_message_text("Выбери период:", reply_markup=stats_keyboard())
-    elif data.startswith("stats:"):
-        period = data.split(":", 1)[1]
-        text, rows, games = build_stats(chat_state, period)
-        if rows and sheets_configured():
-            ok, status = await export_stats(period, rows, games)
-            text += "\n" + sheets_note(ok, status)
-        try:
-            await query.edit_message_text(text, reply_markup=stats_keyboard())
-        except BadRequest as exc:
-            if "not modified" not in str(exc).lower():
-                raise
+    elif data == "admin:bibs":
+        await show_bibs()
+    elif data == "admin:bibs_reset":
+        start_bibs_round(chat_state, "")
+        save_state()
+        await post_bibs_message(context, chat.id, chat_state)
+        await show_bibs("Список манишек обновлён 🔄")
 
 
 # --------------------------------------------------------------------------- #
@@ -1525,12 +1435,11 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             ("list", "Показать список"),
+            ("bibs", "Кто взял манишки"),
             ("open", "Открыть запись (админ)"),
             ("close", "Закрыть запись (админ)"),
             ("menu", "Панель управления (админ)"),
             ("finish", "Завершить игру (админ)"),
-            ("stats", "Статистика посещений"),
-            ("mystats", "Моя статистика"),
             ("help", "Как пользоваться"),
             ("admin", "Команды админов"),
         ]
@@ -1562,15 +1471,13 @@ def main() -> None:
     app.add_handler(CommandHandler("setlimit", setlimit_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
-    app.add_handler(CommandHandler("noshow", noshow_cmd))
-    app.add_handler(CommandHandler("showup", showup_cmd))
     app.add_handler(CommandHandler("finish", finish_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("mystats", mystats_cmd))
+    app.add_handler(CommandHandler(["bibs", "manishki"], bibs_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_RE), plus_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_RE), minus_handler))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(BIBS_TAKE_RE), bibs_take_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)

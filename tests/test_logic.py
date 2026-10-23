@@ -66,6 +66,7 @@ def test_overflow_goes_to_reserve_and_promotes():
     assert [e["user_id"] for e in r["promoted"]] == [3]
     assert [e["user_id"] for e in cs["players"]] == [2, 3]
     assert cs["reserve"] == []
+    assert cs["bibs"]["takers"] == [] and cs["bibs"]["active"] is False
 
 
 def test_guests_overflow_into_reserve_and_promote_in_order():
@@ -108,28 +109,40 @@ def test_find_by_username_name_number():
     assert bot.find_entry_by_query(cs, "nobody") is None
 
 
-def test_finish_records_history_and_rolls_date():
+def test_finish_clears_lists_rolls_date_and_opens_bibs():
     cs = fresh(limit=2)
     cs["game"]["date"] = "17/10/26"
     bot.apply_plus(cs, user(1), 1)
     bot.apply_plus(cs, user(2), None)  # reserve
-    cs["players"][0]["no_show"] = True
-    event = bot.finish_game(cs)
-    assert [p["key"] for p in event["no_shows"]] == ["user:1"]
-    assert event["present"] == []
-    assert [p["key"] for p in event["reserve"]] == ["user:2"]
-    assert len(event["guests"]) == 1
+    finished = bot.finish_game(cs)
+    assert finished == "17/10/26"
     assert cs["players"] == [] and cs["reserve"] == []
     assert cs["game"]["date"] == "24/10/26"
     assert cs["game"]["open"] is False and cs["game"]["was_opened"] is False
+    assert cs["bibs"]["active"] is True and cs["bibs"]["takers"] == [] and cs["bibs"]["game_date"] == "17/10/26"
 
-    text, rows, games = bot.build_stats(cs, "all")
-    assert games == 1
-    assert {r["display_name"]: (r["visits"], r["no_shows"], r["reserve"]) for r in rows} == {
-        "User1": (0, 1, 0),
-        "User2": (0, 0, 1),
-    }
-    assert "No-show: 1" in bot.player_stats_text(cs, 1)
+
+def test_bibs_takers_dedupe_remove_and_reset():
+    cs = fresh()
+    bot.start_bibs_round(cs, "17/10/26")
+    assert bot.add_bibs_taker(cs, user(1, username="alpha")) is True
+    assert bot.add_bibs_taker(cs, user(1, username="alpha")) is False
+    assert bot.add_bibs_taker(cs, user(2)) is True
+    text = bot.format_bibs(cs)
+    assert "1. User1 (@alpha)" in text and "2. User2" in text and "17/10/26" in text
+    assert bot.remove_bibs_taker(cs, 1) is True
+    assert [t["user_id"] for t in cs["bibs"]["takers"]] == [2]
+    bot.start_bibs_round(cs, "")
+    assert cs["bibs"]["takers"] == [] and "Пока никто" in bot.format_bibs(cs)
+
+
+def test_bibs_take_regex():
+    yes = ["я взял", "Я взял!", "взял", "беру", "я забрал манишки", "Взял манишки стирать", "манишки у меня", "я взяла", "заберу"]
+    no = ["я взял мяч", "взял бы", "кто взял?", "+", "манишки"]
+    for t in yes:
+        assert bot.BIBS_TAKE_RE.match(t), t
+    for t in no:
+        assert not bot.BIBS_TAKE_RE.match(t), t
 
 
 def test_roll_date_to_future():
@@ -171,3 +184,4 @@ def test_legacy_state_is_normalized():
     assert cs["game"]["limit"] == 4 and cs["game"]["start"] == "19:00"
     assert names(cs["players"]) == ["Иван", "Пётр (@p)"]
     assert cs["reserve"] == []
+    assert cs["bibs"]["takers"] == [] and cs["bibs"]["active"] is False
