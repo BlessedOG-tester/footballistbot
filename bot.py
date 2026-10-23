@@ -942,11 +942,9 @@ async def bibs_take_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_state = chat_state_for(update)
     message = update.message
     user = update.effective_user
-    bibs = chat_state["bibs"]
-    if not bibs.get("active"):
-        # No round is open (e.g. before the first /finish). Start one so the note is not lost.
-        start_bibs_round(chat_state, chat_state["game"].get("date", ""))
-        bibs = chat_state["bibs"]
+    if not chat_state["bibs"].get("active"):
+        # Bibs are tracked only between /finish and the admin's reset; otherwise ignore.
+        return
     added = add_bibs_taker(chat_state, user)
     save_state()
     if not added:
