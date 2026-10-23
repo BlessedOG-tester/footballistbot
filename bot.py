@@ -815,7 +815,9 @@ async def post_list_update(context: ContextTypes.DEFAULT_TYPE, chat_id: int, cha
 
 
 async def post_bibs_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any]) -> Message:
-    """Send a fresh bibs message and remember it for later edits."""
+    """Send a fresh bibs message and remember it for later edits. Opens a round if none is open."""
+    if not chat_state["bibs"].get("active"):
+        start_bibs_round(chat_state, chat_state["bibs"].get("game_date", ""))
     msg = await context.bot.send_message(chat_id=chat_id, text=format_bibs(chat_state))
     chat_state["bibs"]["message_id"] = msg.message_id
     save_state()
@@ -1147,10 +1149,6 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
         context.args = [arg("time")]
         await settime_cmd(update, context)
     elif action == "finish":
-        chat_state = chat_state_for(update)
-        if not chat_state["players"] and not chat_state["reserve"]:
-            await update.message.reply_text("Список пуст, завершать нечего.")
-            return
         await update.message.reply_text(
             "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, бот спросит, кто забрал манишки.",
             reply_markup=confirm_keyboard("finish"),
@@ -1378,9 +1376,6 @@ async def finish_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await require_admin(update, context):
         return
     chat_state = chat_state_for(update)
-    if not chat_state["players"] and not chat_state["reserve"]:
-        await update.message.reply_text("Список пуст, завершать нечего.")
-        return
     await update.message.reply_text(await do_finish(context, update.effective_chat.id, chat_state))
 
 
@@ -1494,18 +1489,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         msg = await query.message.reply_text("Ответь на это сообщение лимитом участников, например: 18 (0 = без лимита)")
         set_prompt(context, chat.id, "limit", msg.message_id)
     elif data == "admin:finish":
-        if not chat_state["players"] and not chat_state["reserve"]:
-            await show_panel("Список пуст, завершать нечего.")
-            return
         await query.edit_message_text(
             "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, "
             "бот спросит, кто забрал манишки.",
             reply_markup=confirm_keyboard("finish"),
         )
     elif data == "confirm:finish":
-        if not chat_state["players"] and not chat_state["reserve"]:
-            await show_panel("Список пуст, завершать нечего.")
-            return
         text = await do_finish(context, chat.id, chat_state)
         await show_panel(text)
     elif data == "admin:reset":
