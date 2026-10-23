@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sys
+import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,7 @@ from telegram import (
 )
 from telegram.constants import ChatType, ParseMode, ReactionEmoji
 from telegram.error import BadRequest, TelegramError
+import ai
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -871,18 +873,14 @@ def pop_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reply_to_messag
 # --------------------------------------------------------------------------- #
 
 
-async def plus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group(update) or update.effective_user is None or update.message is None:
-        return
+async def do_join(update: Update, context: ContextTypes.DEFAULT_TYPE, guests: Optional[int]) -> None:
+    """Sign the author up (guests=None keeps the current guest count, N sets it)."""
     chat_state = chat_state_for(update)
     message = update.message
+    user = update.effective_user
     if not chat_state["game"].get("open"):
         await message.reply_text("Запись сейчас закрыта.")
         return
-
-    match = PLUS_RE.match(message.text or "")
-    guests = int(match.group("count")) if match and match.group("count") else None
-    user = update.effective_user
 
     result = apply_plus(chat_state, user, guests)
     save_state()
@@ -909,13 +907,10 @@ async def plus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await announce_promotions(context, update.effective_chat.id, result["promoted"])
 
 
-async def minus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group(update) or update.effective_user is None or update.message is None:
-        return
+async def do_leave(update: Update, context: ContextTypes.DEFAULT_TYPE, guests: Optional[int]) -> None:
+    """Remove the author (guests=None: with all guests; N: only N guests)."""
     chat_state = chat_state_for(update)
     message = update.message
-    match = MINUS_RE.match(message.text or "")
-    guests = int(match.group("count")) if match and match.group("count") else None
     user = update.effective_user
 
     if not user_in_any_list(chat_state, user.id) and total_guests(chat_state, user.id) == 0:
@@ -935,24 +930,50 @@ async def minus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await announce_promotions(context, update.effective_chat.id, result["promoted"])
 
 
-async def bibs_take_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Someone wrote 'я взял' — record them as holding the bibs."""
-    if not is_group(update) or update.effective_user is None or update.message is None:
-        return
+async def do_bibs_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Record the author as holding the bibs. Returns False when no bibs round is open."""
     chat_state = chat_state_for(update)
     message = update.message
     user = update.effective_user
     if not chat_state["bibs"].get("active"):
         # Bibs are tracked only between /finish and the admin's reset; otherwise ignore.
-        return
+        return False
     added = add_bibs_taker(chat_state, user)
     save_state()
     if not added:
         await message.reply_text("Ты уже в списке манишек 🧺")
-        return
+        return True
     await react(message, ReactionEmoji.THUMBS_UP)
     await refresh_bibs_message(context, update.effective_chat.id, chat_state)
     await message.reply_text(f"Записал: {full_name(user)} забрал манишки стирать 🧺\n\n" + format_bibs(chat_state))
+    return True
+
+
+def _group_text_update(update: Update) -> bool:
+    return is_group(update) and update.effective_user is not None and update.message is not None
+
+
+async def plus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _group_text_update(update):
+        return
+    match = PLUS_RE.match(update.message.text or "")
+    guests = int(match.group("count")) if match and match.group("count") else None
+    await do_join(update, context, guests)
+
+
+async def minus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _group_text_update(update):
+        return
+    match = MINUS_RE.match(update.message.text or "")
+    guests = int(match.group("count")) if match and match.group("count") else None
+    await do_leave(update, context, guests)
+
+
+async def bibs_take_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Someone wrote 'я взял' — record them as holding the bibs."""
+    if not _group_text_update(update):
+        return
+    await do_bibs_take(update, context)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,10 +988,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     reply_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
-    if reply_id is None:
-        return
     prompt = context.chat_data.get("prompt")
-    if not isinstance(prompt, dict) or prompt.get("message_id") != reply_id:
+    if reply_id is None or not isinstance(prompt, dict) or prompt.get("message_id") != reply_id:
+        await ai_handler(update, context)
         return
     if not await is_admin(update, context):
         return
@@ -1015,6 +1035,129 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(response + "\n\n" + format_game(chat_state), reply_markup=admin_keyboard(chat_state))
     if chat_state["game"].get("list_message_id"):
         await refresh_list_message(context, update.effective_chat.id, chat_state)
+
+
+# --------------------------------------------------------------------------- #
+# AI layer (optional, needs OPENAI_API_KEY)
+# --------------------------------------------------------------------------- #
+
+AI_HISTORY_LIMIT = 20
+AI_MIN_CONFIDENCE = 0.7
+
+
+def remember_message(context: ContextTypes.DEFAULT_TYPE, author: str, text: str) -> None:
+    history: List[str] = context.chat_data.setdefault("history", [])
+    history.append(f"{author}: {text.strip()[:300]}")
+    del history[:-AI_HISTORY_LIMIT]
+
+
+async def history_recorder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs for every group text message (own handler group) and only records it for AI context."""
+    if not _group_text_update(update) or not ai.enabled():
+        return
+    remember_message(context, full_name(update.effective_user), update.message.text or "")
+
+
+def date_table() -> str:
+    rows = []
+    for offset in range(0, 8):
+        day = today() + timedelta(days=offset)
+        label = "сегодня" if offset == 0 else ("завтра" if offset == 1 else "")
+        rows.append(f"{day.strftime('%d/%m/%y')} — {WEEKDAYS_RU[day.weekday()]}{' (' + label + ')' if label else ''}")
+    return "\n".join(rows) + f"\nСейчас {today().strftime('%H:%M')}."
+
+
+async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Free-form message: ask the model what the author means and act through the normal code paths."""
+    if not ai.enabled() or not _group_text_update(update):
+        return
+    message = update.message
+    text = (message.text or "").strip()
+    if not text or len(text) > ai.MAX_MESSAGE_CHARS or update.effective_user.is_bot:
+        return
+
+    chat_state = chat_state_for(update)
+    admin = await is_admin(update, context)
+    history: List[str] = list(context.chat_data.get("history", []))
+    # The recorder already appended the current message; show the model the earlier ones only.
+    if history and history[-1].endswith(text[:300]):
+        history = history[:-1]
+
+    intent = await asyncio.to_thread(
+        ai.classify_sync,
+        text,
+        full_name(update.effective_user),
+        admin,
+        format_game(chat_state),
+        format_bibs(chat_state),
+        date_table(),
+        history,
+    )
+    if not intent or intent["intent"] == "none":
+        return
+    logger.info("AI intent in %s: %s", update.effective_chat.id, intent)
+    if intent["confidence"] < AI_MIN_CONFIDENCE:
+        return
+
+    kind = intent["intent"]
+    if kind == "join":
+        await do_join(update, context, intent["guests"] if intent["guests"] else None)
+    elif kind == "leave":
+        await do_leave(update, context, intent["guests"] or None)
+    elif kind == "bibs_taken":
+        await do_bibs_take(update, context)
+    elif kind == "question":
+        if intent["reply"]:
+            reply = await message.reply_text(intent["reply"])
+            remember_message(context, "Бот", reply.text or "")
+    elif kind == "admin":
+        await ai_admin_action(update, context, intent)
+
+
+async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, intent: Dict[str, Any]) -> None:
+    action = intent.get("action")
+    args = intent.get("args") or {}
+    if not action:
+        return
+    if not await is_admin(update, context):
+        await update.message.reply_text("Это может сделать только админ чата.")
+        return
+
+    def arg(name: str) -> str:
+        value = args.get(name)
+        return str(value).strip() if value not in (None, "") else ""
+
+    if action == "open":
+        context.args = [a for a in (arg("date"), arg("time")) if a]
+        await open_cmd(update, context)
+    elif action == "close":
+        await close_cmd(update, context)
+    elif action == "list":
+        await list_cmd(update, context)
+    elif action == "setlimit":
+        context.args = [arg("limit")]
+        await setlimit_cmd(update, context)
+    elif action == "setfield":
+        context.args = arg("field").split()
+        await setfield_cmd(update, context)
+    elif action == "setdate":
+        context.args = [arg("date")]
+        await setdate_cmd(update, context)
+    elif action == "settime":
+        context.args = [arg("time")]
+        await settime_cmd(update, context)
+    elif action == "finish":
+        chat_state = chat_state_for(update)
+        if not chat_state["players"] and not chat_state["reserve"]:
+            await update.message.reply_text("Список пуст, завершать нечего.")
+            return
+        await update.message.reply_text(
+            "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, бот спросит, кто забрал манишки.",
+            reply_markup=confirm_keyboard("finish"),
+        )
+    elif action == "bibs_reset":
+        context.args = ["reset"]
+        await bibs_cmd(update, context)
 
 
 # --------------------------------------------------------------------------- #
@@ -1456,6 +1599,7 @@ def main() -> None:
 
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, history_recorder), group=-1)
     app.add_handler(CommandHandler(["start", "help"], start_cmd))
     app.add_handler(CommandHandler("admin", admin_help_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
@@ -1480,7 +1624,7 @@ def main() -> None:
     app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)
 
-    logger.info("Bot is running, state file: %s", STATE_FILE)
+    logger.info("Bot is running, state file: %s, AI: %s", STATE_FILE, f"on ({ai.OPENAI_MODEL})" if ai.enabled() else "off")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
