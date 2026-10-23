@@ -130,8 +130,16 @@ def test_bibs_takers_dedupe_remove_and_reset():
     assert bot.add_bibs_taker(cs, user(2)) is True
     text = bot.format_bibs(cs)
     assert "1. User1 (@alpha)" in text and "2. User2" in text and "17/10/26" in text
-    assert bot.remove_bibs_taker(cs, 1) is True
-    assert [t["user_id"] for t in cs["bibs"]["takers"]] == [2]
+    assert bot.add_bibs_taker_by_name(cs, "Алишер") is True
+    assert bot.add_bibs_taker_by_name(cs, "алишер") is False  # case-insensitive dedupe
+    assert bot.split_names("Фаррух, Далер и @sher") == ["Фаррух", "Далер", "sher"]
+    assert bot.find_bibs_taker(cs, "@ALPHA") == 0
+    assert bot.find_bibs_taker(cs, "али") == 2
+    assert bot.find_bibs_taker(cs, "3") == 2
+    assert bot.find_bibs_taker(cs, "nobody") is None
+    removed = bot.remove_bibs_taker(cs, bot.find_bibs_taker(cs, "alpha"))
+    assert removed["user_id"] == 1
+    assert [t["name"] for t in cs["bibs"]["takers"]] == ["User2", "Алишер"]
     bot.start_bibs_round(cs, "")
     assert cs["bibs"]["takers"] == [] and "Пока никто" in bot.format_bibs(cs)
 

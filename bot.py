@@ -585,11 +585,43 @@ def add_bibs_taker(chat_state: Dict[str, Any], user: User) -> bool:
     return True
 
 
-def remove_bibs_taker(chat_state: Dict[str, Any], user_id: int) -> bool:
+def add_bibs_taker_by_name(chat_state: Dict[str, Any], name: str) -> bool:
+    """Admin adds someone by name (no Telegram account needed). Returns False if already listed."""
     bibs = chat_state["bibs"]
-    before = len(bibs["takers"])
-    bibs["takers"] = [t for t in bibs["takers"] if t.get("user_id") != user_id]
-    return len(bibs["takers"]) != before
+    name = name.strip().lstrip("@")
+    if not name:
+        return False
+    if any((t.get("name") or "").lower() == name.lower() or (t.get("username") or "").lower() == name.lower() for t in bibs["takers"]):
+        return False
+    bibs["takers"].append({"user_id": None, "name": name, "username": "", "taken_at": now_iso()})
+    return True
+
+
+def find_bibs_taker(chat_state: Dict[str, Any], query: str) -> Optional[int]:
+    """Index of a taker by @username, exact name, name fragment or list number."""
+    q = query.strip().lstrip("@").lower()
+    takers = chat_state["bibs"]["takers"]
+    if not q:
+        return None
+    if q.isdigit() and 1 <= int(q) <= len(takers):
+        return int(q) - 1
+    for i, t in enumerate(takers):
+        if (t.get("username") or "").lower() == q or (t.get("name") or "").lower() == q:
+            return i
+    for i, t in enumerate(takers):
+        if q in (t.get("name") or "").lower():
+            return i
+    return None
+
+
+def remove_bibs_taker(chat_state: Dict[str, Any], index: int) -> Dict[str, Any]:
+    return chat_state["bibs"]["takers"].pop(index)
+
+
+def split_names(raw: str) -> List[str]:
+    """'Алишер, Фаррух и Далер' -> ['Алишер', 'Фаррух', 'Далер']."""
+    parts = re.split(r"\s*(?:,|;|\n|\s+и\s+)\s*", raw.strip())
+    return [p.strip().lstrip("@") for p in parts if p.strip().lstrip("@")]
 
 
 def format_bibs(chat_state: Dict[str, Any]) -> str:
@@ -686,7 +718,8 @@ def admin_help_text() -> str:
         "/finish — завершить игру: очистить список, перенести дату на неделю и открыть учёт манишек\n"
         "/bibs — список, кто взял манишки\n"
         "/bibs reset — обновить список манишек (манишки вернули)\n"
-        "/bibs remove @username|Имя — убрать человека из списка манишек\n"
+        "/bibs add Имя1, Имя2 — внести в список манишек вручную (например, уже существующий список)\n"
+        "/bibs remove @username|Имя|№ — убрать человека из списка манишек\n"
         "/reset — очистить список игроков\n"
         "/menu — inline-панель"
     )
@@ -1156,6 +1189,13 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     elif action == "bibs_reset":
         context.args = ["reset"]
         await bibs_cmd(update, context)
+    elif action == "bibs_add":
+        names = args.get("names")
+        raw = ", ".join(str(n) for n in names) if isinstance(names, list) else arg("names")
+        await bibs_add_names(update, context, chat_state_for(update), raw)
+    elif action == "bibs_remove":
+        context.args = ["remove", arg("name")]
+        await bibs_cmd(update, context)
 
 
 # --------------------------------------------------------------------------- #
@@ -1395,24 +1435,40 @@ async def bibs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await post_bibs_message(context, update.effective_chat.id, chat_state)
         return
 
-    if sub in ("remove", "убрать", "del"):
+    if sub in ("add", "добавить", "+"):
         if not await require_admin(update, context):
             return
-        q = " ".join(args[1:]).strip().lstrip("@").lower()
-        takers = chat_state["bibs"]["takers"]
-        target = next((t for t in takers if (t.get("username") or "").lower() == q), None) or next(
-            (t for t in takers if q and q in (t.get("name") or "").lower()), None
-        )
-        if target is None:
+        await bibs_add_names(update, context, chat_state, " ".join(args[1:]))
+        return
+
+    if sub in ("remove", "убрать", "del", "-"):
+        if not await require_admin(update, context):
+            return
+        index = find_bibs_taker(chat_state, " ".join(args[1:]))
+        if index is None:
             await update.message.reply_text("Не нашёл такого в списке манишек.")
             return
-        remove_bibs_taker(chat_state, target["user_id"])
+        target = remove_bibs_taker(chat_state, index)
         save_state()
         await refresh_bibs_message(context, update.effective_chat.id, chat_state)
         await update.message.reply_text(f"Убрал {target['name']} из списка манишек ✅\n\n" + format_bibs(chat_state))
         return
 
     await post_bibs_message(context, update.effective_chat.id, chat_state)
+
+
+async def bibs_add_names(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_state: Dict[str, Any], raw: str) -> None:
+    names = split_names(raw)
+    if not names:
+        await update.message.reply_text("Укажи имена: /bibs add Алишер, Фаррух")
+        return
+    if not chat_state["bibs"].get("active"):
+        start_bibs_round(chat_state, chat_state["bibs"].get("game_date", ""))
+    added = [n for n in names if add_bibs_taker_by_name(chat_state, n)]
+    save_state()
+    await refresh_bibs_message(context, update.effective_chat.id, chat_state)
+    note = f"Добавил в список манишек: {', '.join(added)} ✅" if added else "Все уже были в списке."
+    await update.message.reply_text(note + "\n\n" + format_bibs(chat_state))
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
