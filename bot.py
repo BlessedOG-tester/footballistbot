@@ -325,6 +325,7 @@ def normalize_chat(chat_state: Any) -> Dict[str, Any]:
     normalized["players"] = normalize_players(normalized.get("players", []))
     normalized["reserve"] = normalize_players(normalized.get("reserve", []))
     normalized["bibs"] = normalize_bibs(normalized.get("bibs"))
+    normalized["ai_enabled"] = bool(normalized.get("ai_enabled", True))
     normalized.pop("history", None)  # attendance statistics were dropped
     return normalized
 
@@ -695,6 +696,8 @@ def help_text() -> str:
         "-1…-5 — убрать часть гостей\n"
         "/list — показать список\n"
         "«я взял» — после игры отметить, что забрал манишки стирать\n"
+        "Вопрос боту: упомяни @бота, ответь на его сообщение или начни со слова «бот» — "
+        "например, «бот, во сколько сегодня?», «бот, я с другом»\n"
         "/bibs или слово «манишки» — у кого сейчас манишки\n\n"
         "Если основа заполнена, попадаешь в резерв. Когда кто-то выходит, "
         "первый из резерва поднимается автоматически, бот напишет об этом.\n\n"
@@ -721,6 +724,7 @@ def admin_help_text() -> str:
         "/bibs add Имя1, Имя2 — внести в список манишек вручную (например, уже существующий список)\n"
         "/bibs remove @username|Имя|№ — убрать человека из списка манишек\n"
         "/reset — очистить список игроков\n"
+        "/ai on|off — включить/выключить ИИ в этом чате\n"
         "/menu — inline-панель"
     )
 
@@ -1078,6 +1082,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 AI_HISTORY_LIMIT = 20
 AI_MIN_CONFIDENCE = 0.7
+# A free-form message goes to the model only when it is addressed to the bot:
+# "@botusername ...", a reply to a bot message, or a message starting with "бот"/"bot".
+AI_TRIGGER_RE = re.compile(r"^\s*(?:бот|ботик|bot)\b[\s,:!—-]*", re.IGNORECASE)
+
+
+def addressed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """Return the message text with the bot mention/trigger stripped if the message is for the bot, else None."""
+    message = update.message
+    text = (message.text or "").strip()
+    bot_user = context.bot.username or ""
+    bot_id = context.bot.id
+
+    if message.reply_to_message is not None and message.reply_to_message.from_user is not None:
+        if message.reply_to_message.from_user.id == bot_id:
+            return text
+
+    if bot_user:
+        mention = re.compile(rf"@{re.escape(bot_user)}\b", re.IGNORECASE)
+        if mention.search(text):
+            return mention.sub(" ", text).strip(" ,:!—-")
+
+    trigger = AI_TRIGGER_RE.match(text)
+    if trigger:
+        return text[trigger.end():].strip() or text
+    return None
 
 
 def remember_message(context: ContextTypes.DEFAULT_TYPE, author: str, text: str) -> None:
@@ -1107,15 +1136,20 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not ai.enabled() or not _group_text_update(update):
         return
     message = update.message
-    text = (message.text or "").strip()
-    if not text or len(text) > ai.MAX_MESSAGE_CHARS or update.effective_user.is_bot:
+    if update.effective_user.is_bot:
+        return
+    chat_state = chat_state_for(update)
+    if not chat_state.get("ai_enabled", True):
+        return
+    text = addressed_to_bot(update, context)
+    if not text or len(text) > ai.MAX_MESSAGE_CHARS:
         return
 
-    chat_state = chat_state_for(update)
     admin = await is_admin(update, context)
     history: List[str] = list(context.chat_data.get("history", []))
     # The recorder already appended the current message; show the model the earlier ones only.
-    if history and history[-1].endswith(text[:300]):
+    raw_text = (message.text or "").strip()
+    if history and history[-1].endswith(raw_text[:300]):
         history = history[:-1]
 
     intent = await asyncio.to_thread(
@@ -1471,6 +1505,31 @@ async def bibs_add_names(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     await update.message.reply_text(note + "\n\n" + format_bibs(chat_state))
 
 
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ai on|off — admins switch the AI layer for this chat."""
+    if not await require_admin(update, context):
+        return
+    chat_state = chat_state_for(update)
+    arg = (context.args or [""])[0].lower()
+    if arg in ("on", "вкл"):
+        chat_state["ai_enabled"] = True
+    elif arg in ("off", "выкл"):
+        chat_state["ai_enabled"] = False
+    else:
+        status = "включён" if chat_state.get("ai_enabled", True) else "выключен"
+        await update.message.reply_text(f"ИИ в этом чате {status}. /ai on — включить, /ai off — выключить.")
+        return
+    save_state()
+    if not ai.enabled():
+        await update.message.reply_text("Сохранил, но на сервере не задан OPENAI_API_KEY — ИИ всё равно не работает.")
+        return
+    await update.message.reply_text(
+        "ИИ включён ✅ Отвечаю, если меня упомянуть (@" + (context.bot.username or "бот") + "), ответить на моё сообщение или начать фразу со слова «бот»."
+        if chat_state["ai_enabled"]
+        else "ИИ выключен ⛔️ Работают только +, -, «я взял» и команды."
+    )
+
+
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
@@ -1661,6 +1720,7 @@ def main() -> None:
     app.add_handler(CommandHandler("finish", finish_cmd))
     app.add_handler(CommandHandler(["bibs", "manishki"], bibs_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(PLUS_RE), plus_handler))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(MINUS_RE), minus_handler))
