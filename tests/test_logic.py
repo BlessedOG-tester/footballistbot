@@ -159,7 +159,7 @@ def test_bibs_takers_dedupe_remove_and_reset():
     assert removed["user_id"] == 1
     assert [t["name"] for t in cs["bibs"]["takers"]] == ["User2", "Алишер"]
     bot.start_bibs_round(cs, "")
-    assert cs["bibs"]["takers"] == [] and "Пока никто" in bot.format_bibs(cs)
+    assert cs["bibs"]["takers"] == [] and "(0/30)" in bot.format_bibs(cs) and "\n1.\n" in bot.format_bibs(cs)
 
 
 def test_bibs_take_regex():

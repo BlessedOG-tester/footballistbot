@@ -707,19 +707,22 @@ def format_bibs(chat_state: Dict[str, Any]) -> str:
     bibs = chat_state["bibs"]
     date_text = f" (список с {bibs['game_date']})" if bibs.get("game_date") else ""
     limit = int(bibs.get("limit") or 0)
-    count_text = f"{len(bibs['takers'])}/{limit}" if limit else str(len(bibs["takers"]))
-    if bibs["takers"]:
-        rows = []
-        for i, t in enumerate(bibs["takers"], start=1):
-            username = f" (@{t['username']})" if t.get("username") else ""
-            rows.append(f"{i}. {t['name']}{username}")
-        body = "\n".join(rows)
-    else:
-        body = "Пока никто не отметился."
+    takers = bibs["takers"]
+    count_text = f"{len(takers)}/{limit}" if limit else str(len(takers))
+
+    rows = []
+    for i, t in enumerate(takers, start=1):
+        username = f" (@{t['username']})" if t.get("username") else ""
+        rows.append(f"{i}. {t['name']}{username}")
+    # Show the remaining free slots as empty numbers, like a hand-written list.
+    for i in range(len(takers) + 1, limit + 1):
+        rows.append(f"{i}.")
+    body = "\n".join(rows) if rows else "Пока никто не отметился."
+
     return (
         f"🧺 Манишки{date_text}\n"
         "Кто забрал манишки стирать — напиши «я взял».\n"
-        + (f"Когда отметятся {limit} человек, список начнётся заново.\n" if limit else "")
+        + (f"Когда список дойдёт до {limit}, он начнётся заново.\n" if limit else "")
         + f"\nВзяли стирать ({count_text}):\n{body}"
     )
 
