@@ -49,6 +49,7 @@ DEFAULT_FIELD = os.getenv("DEFAULT_FIELD", "Горизонт-арена")
 DEFAULT_START = os.getenv("DEFAULT_START", "20:30")
 DEFAULT_END = os.getenv("DEFAULT_END", "22:30")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "18"))
+BIBS_ROUND_SIZE = int(os.getenv("BIBS_ROUND_SIZE", "30"))  # the bibs list restarts after this many people
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "5"))
 TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
 MAX_GUESTS = 5
@@ -218,6 +219,7 @@ def default_bibs() -> Dict[str, Any]:
         "takers": [],  # [{user_id, name, username, taken_at}]
         "message_id": None,  # the bibs message the bot keeps editing
         "game_date": "",  # the game after which this round started
+        "limit": BIBS_ROUND_SIZE,  # list restarts automatically after this many people
     }
 
 
@@ -278,6 +280,10 @@ def normalize_bibs(raw: Any) -> Dict[str, Any]:
         bibs["active"] = bool(raw.get("active", False))
         bibs["message_id"] = raw.get("message_id")
         bibs["game_date"] = raw.get("game_date", "") or ""
+        try:
+            bibs["limit"] = max(0, int(raw.get("limit", BIBS_ROUND_SIZE)))
+        except (TypeError, ValueError):
+            bibs["limit"] = BIBS_ROUND_SIZE
         takers = raw.get("takers", [])
         if isinstance(takers, list):
             for item in takers:
@@ -591,9 +597,28 @@ def archive_bibs_round(chat_state: Dict[str, Any]) -> None:
 def start_bibs_round(chat_state: Dict[str, Any], game_date_text: str) -> None:
     """Called on /finish or reset: the old round is archived and a new 'who took the bibs' round starts."""
     archive_bibs_round(chat_state)
+    limit = (chat_state.get("bibs") or {}).get("limit", BIBS_ROUND_SIZE)
     chat_state["bibs"] = default_bibs()
     chat_state["bibs"]["active"] = True
     chat_state["bibs"]["game_date"] = game_date_text
+    chat_state["bibs"]["limit"] = limit
+
+
+def ensure_bibs_round(chat_state: Dict[str, Any], game_date_text: str = "") -> None:
+    """Open a round if none is open; an open round is kept (the list accumulates across games)."""
+    bibs = chat_state["bibs"]
+    if not bibs.get("active"):
+        start_bibs_round(chat_state, game_date_text or bibs.get("game_date", ""))
+
+
+def rollover_bibs_if_full(chat_state: Dict[str, Any]) -> bool:
+    """When the round reached its size, archive it and start a new one. Returns True if it rolled over."""
+    bibs = chat_state["bibs"]
+    limit = int(bibs.get("limit") or 0)
+    if limit and len(bibs["takers"]) >= limit:
+        start_bibs_round(chat_state, today_str())
+        return True
+    return False
 
 
 def bibs_all_time(chat_state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -680,7 +705,9 @@ def split_names(raw: str) -> List[str]:
 
 def format_bibs(chat_state: Dict[str, Any]) -> str:
     bibs = chat_state["bibs"]
-    date_text = f" после игры {bibs['game_date']}" if bibs.get("game_date") else ""
+    date_text = f" (список с {bibs['game_date']})" if bibs.get("game_date") else ""
+    limit = int(bibs.get("limit") or 0)
+    count_text = f"{len(bibs['takers'])}/{limit}" if limit else str(len(bibs["takers"]))
     if bibs["takers"]:
         rows = []
         for i, t in enumerate(bibs["takers"], start=1):
@@ -691,8 +718,9 @@ def format_bibs(chat_state: Dict[str, Any]) -> str:
         body = "Пока никто не отметился."
     return (
         f"🧺 Манишки{date_text}\n"
-        "Кто забрал манишки стирать — напиши «я взял».\n\n"
-        f"Взяли стирать:\n{body}"
+        "Кто забрал манишки стирать — напиши «я взял».\n"
+        + (f"Когда отметятся {limit} человек, список начнётся заново.\n" if limit else "")
+        + f"\nВзяли стирать ({count_text}):\n{body}"
     )
 
 
@@ -771,10 +799,11 @@ def admin_help_text() -> str:
         "/setlimit N — лимит мест (0 = без лимита)\n"
         "/add Имя — добавить игрока вручную\n"
         "/remove @username|Имя|№ — убрать игрока\n"
-        "/finish — завершить игру: очистить список, перенести дату на неделю и открыть учёт манишек\n"
+        "/finish — завершить игру: очистить список, перенести дату на неделю и напомнить про манишки\n"
         "/bibs — список, кто взял манишки; /bibs history — за всё время\n"
         "/bibs reset — обновить список манишек (манишки вернули)\n"
         "/bibs add Имя1, Имя2 — внести в список манишек вручную (например, уже существующий список)\n"
+        "/bibs limit N — после скольких человек список манишек начинается заново (по умолчанию 30)\n"
         "/bibs remove @username|Имя|№ — убрать человека из списка манишек\n"
         "/reset — очистить список игроков\n"
         "/ai on|off — включить/выключить ИИ в этом чате\n"
@@ -906,8 +935,7 @@ async def post_list_update(context: ContextTypes.DEFAULT_TYPE, chat_id: int, cha
 
 async def post_bibs_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_state: Dict[str, Any]) -> Message:
     """Send a fresh bibs message and remember it for later edits. Opens a round if none is open."""
-    if not chat_state["bibs"].get("active"):
-        start_bibs_round(chat_state, chat_state["bibs"].get("game_date", ""))
+    ensure_bibs_round(chat_state)
     msg = await context.bot.send_message(chat_id=chat_id, text=format_bibs(chat_state))
     chat_state["bibs"]["message_id"] = msg.message_id
     save_state()
@@ -1038,6 +1066,13 @@ async def do_bibs_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     await react(message, ReactionEmoji.THUMBS_UP)
     await refresh_bibs_message(context, update.effective_chat.id, chat_state)
     await message.reply_text(f"Записал: {full_name(user)} забрал манишки стирать 🧺\n\n" + format_bibs(chat_state))
+    if rollover_bibs_if_full(chat_state):
+        save_state()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Круг манишек заполнен — прошлый список ушёл в историю (/bibs history), начинаю новый 🔄",
+        )
+        await post_bibs_message(context, update.effective_chat.id, chat_state)
     return True
 
 
@@ -1279,7 +1314,7 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
         await settime_cmd(update, context)
     elif action == "finish":
         await update.message.reply_text(
-            "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, бот спросит, кто забрал манишки.",
+            "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, бот напомнит про манишки.",
             reply_markup=confirm_keyboard("finish"),
         )
     elif action == "bibs_reset":
@@ -1483,7 +1518,7 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def finish_game(chat_state: Dict[str, Any]) -> str:
-    """Clear the lists, roll the date one week forward and open a new bibs round. Returns the finished game's date."""
+    """Clear the lists, roll the date one week forward and make sure a bibs round is open. Returns the finished game's date."""
     game = chat_state["game"]
     finished_date = game["date"]
     chat_state["players"] = []
@@ -1494,7 +1529,7 @@ def finish_game(chat_state: Dict[str, Any]) -> str:
     game["was_opened"] = False
     game["reminder_sent"] = False
     game["winners_prompt_message_id"] = None
-    start_bibs_round(chat_state, finished_date)
+    ensure_bibs_round(chat_state, finished_date)
     return finished_date
 
 
@@ -1535,6 +1570,20 @@ async def bibs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(format_bibs_history(chat_state))
         return
 
+    if sub in ("limit", "лимит", "size"):
+        if not await require_admin(update, context):
+            return
+        try:
+            chat_state["bibs"]["limit"] = parse_limit(args[1] if len(args) > 1 else "")
+        except ValueError:
+            await update.message.reply_text("Укажи число: /bibs limit 30 (0 = без автообновления)")
+            return
+        save_state()
+        limit = chat_state["bibs"]["limit"]
+        await update.message.reply_text(f"Список манишек будет начинаться заново после {limit} человек ✅" if limit else "Автообновление списка манишек выключено ✅")
+        await refresh_bibs_message(context, update.effective_chat.id, chat_state)
+        return
+
     if sub in ("add", "добавить", "+"):
         if not await require_admin(update, context):
             return
@@ -1562,13 +1611,16 @@ async def bibs_add_names(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     if not names:
         await update.message.reply_text("Укажи имена: /bibs add Алишер, Фаррух")
         return
-    if not chat_state["bibs"].get("active"):
-        start_bibs_round(chat_state, chat_state["bibs"].get("game_date", ""))
+    ensure_bibs_round(chat_state)
     added = [n for n in names if add_bibs_taker_by_name(chat_state, n)]
     save_state()
     await refresh_bibs_message(context, update.effective_chat.id, chat_state)
     note = f"Добавил в список манишек: {', '.join(added)} ✅" if added else "Все уже были в списке."
     await update.message.reply_text(note + "\n\n" + format_bibs(chat_state))
+    if rollover_bibs_if_full(chat_state):
+        save_state()
+        await update.message.reply_text("Круг манишек заполнен — список ушёл в историю (/bibs history), начинаю новый 🔄")
+        await post_bibs_message(context, update.effective_chat.id, chat_state)
 
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1672,7 +1724,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "admin:finish":
         await query.edit_message_text(
             "Завершить игру? Список очистится, дата перенесётся на неделю вперёд, "
-            "бот спросит, кто забрал манишки.",
+            "бот напомнит про манишки.",
             reply_markup=confirm_keyboard("finish"),
         )
     elif data == "confirm:finish":

@@ -122,6 +122,24 @@ def test_finish_clears_lists_rolls_date_and_opens_bibs():
     assert cs["bibs"]["active"] is True and cs["bibs"]["takers"] == [] and cs["bibs"]["game_date"] == "17/10/26"
 
 
+def test_bibs_list_accumulates_across_games_and_rolls_over():
+    cs = fresh()
+    cs["bibs"]["limit"] = 3
+    bot.finish_game(cs)
+    bot.add_bibs_taker(cs, user(1))
+    bot.finish_game(cs)  # next game: list is kept
+    assert [t["user_id"] for t in cs["bibs"]["takers"]] == [1]
+    bot.add_bibs_taker(cs, user(2))
+    assert bot.rollover_bibs_if_full(cs) is False
+    bot.add_bibs_taker(cs, user(3))
+    assert bot.rollover_bibs_if_full(cs) is True
+    assert cs["bibs"]["takers"] == [] and cs["bibs"]["limit"] == 3
+    assert len(cs["bibs_history"]) == 1 and [t["user_id"] for t in cs["bibs_history"][0]["takers"]] == [1, 2, 3]
+    assert "3/3" not in bot.format_bibs(cs) and "0/3" in bot.format_bibs(cs)
+    rows = bot.bibs_all_time(cs)
+    assert len(rows) == 3
+
+
 def test_bibs_takers_dedupe_remove_and_reset():
     cs = fresh()
     bot.start_bibs_round(cs, "17/10/26")
