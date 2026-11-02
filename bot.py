@@ -230,6 +230,7 @@ def default_chat_state(chat_title: str = "", chat_type: str = "") -> Dict[str, A
         "players": [],
         "reserve": [],
         "bibs": default_bibs(),
+        "bibs_history": [],  # archived rounds: [{game_date, closed_at, takers:[{name, username, user_id}]}]
     }
 
 
@@ -326,6 +327,8 @@ def normalize_chat(chat_state: Any) -> Dict[str, Any]:
     normalized["reserve"] = normalize_players(normalized.get("reserve", []))
     normalized["bibs"] = normalize_bibs(normalized.get("bibs"))
     normalized["ai_enabled"] = bool(normalized.get("ai_enabled", True))
+    history = normalized.get("bibs_history")
+    normalized["bibs_history"] = [r for r in history if isinstance(r, dict)] if isinstance(history, list) else []
     normalized.pop("history", None)  # attendance statistics were dropped
     return normalized
 
@@ -568,11 +571,61 @@ def find_entry_by_query(chat_state: Dict[str, Any], query: str) -> Optional[Tupl
 # --------------------------------------------------------------------------- #
 
 
+def archive_bibs_round(chat_state: Dict[str, Any]) -> None:
+    """Move the current round (if anyone is in it) into bibs_history."""
+    bibs = chat_state.get("bibs") or {}
+    if not bibs.get("takers"):
+        return
+    chat_state.setdefault("bibs_history", []).append(
+        {
+            "game_date": bibs.get("game_date", "") or "",
+            "closed_at": now_iso(),
+            "takers": [
+                {"name": t.get("name", ""), "username": t.get("username", ""), "user_id": t.get("user_id")}
+                for t in bibs["takers"]
+            ],
+        }
+    )
+
+
 def start_bibs_round(chat_state: Dict[str, Any], game_date_text: str) -> None:
-    """Called on /finish: a new round of 'who took the bibs' starts, the old list is dropped."""
+    """Called on /finish or reset: the old round is archived and a new 'who took the bibs' round starts."""
+    archive_bibs_round(chat_state)
     chat_state["bibs"] = default_bibs()
     chat_state["bibs"]["active"] = True
     chat_state["bibs"]["game_date"] = game_date_text
+
+
+def bibs_all_time(chat_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Per-person totals over archived rounds plus the current one, most frequent first."""
+    rounds = list(chat_state.get("bibs_history", []))
+    current = chat_state.get("bibs") or {}
+    if current.get("takers"):
+        rounds.append({"game_date": current.get("game_date", ""), "takers": current["takers"], "current": True})
+    totals: Dict[str, Dict[str, Any]] = {}
+    for rnd in rounds:
+        for t in rnd.get("takers", []):
+            key = f"user:{t['user_id']}" if t.get("user_id") else f"name:{(t.get('name') or '').lower()}"
+            row = totals.setdefault(key, {"name": t.get("name") or "Игрок", "username": t.get("username") or "", "count": 0, "last": ""})
+            row["count"] += 1
+            row["last"] = rnd.get("game_date") or row["last"]
+            if t.get("username"):
+                row["username"] = t["username"]
+    return sorted(totals.values(), key=lambda r: (-r["count"], r["name"].lower()))
+
+
+def format_bibs_history(chat_state: Dict[str, Any]) -> str:
+    rows = bibs_all_time(chat_state)
+    rounds = len(chat_state.get("bibs_history", [])) + (1 if (chat_state.get("bibs") or {}).get("takers") else 0)
+    if not rows:
+        return "🧺 Манишки за всё время: пока никто не отмечался."
+    lines = [f"🧺 Манишки за всё время (кругов: {rounds})"]
+    for i, r in enumerate(rows, start=1):
+        username = f" (@{r['username']})" if r["username"] else ""
+        times = "раз" if r["count"] % 10 == 1 and r["count"] % 100 != 11 else ("раза" if 2 <= r["count"] % 10 <= 4 and not 12 <= r["count"] % 100 <= 14 else "раз")
+        last = f", последний — {r['last']}" if r["last"] else ""
+        lines.append(f"{i}. {r['name']}{username}: {r['count']} {times}{last}")
+    return "\n".join(lines)
 
 
 def add_bibs_taker(chat_state: Dict[str, Any], user: User) -> bool:
@@ -719,7 +772,7 @@ def admin_help_text() -> str:
         "/add Имя — добавить игрока вручную\n"
         "/remove @username|Имя|№ — убрать игрока\n"
         "/finish — завершить игру: очистить список, перенести дату на неделю и открыть учёт манишек\n"
-        "/bibs — список, кто взял манишки\n"
+        "/bibs — список, кто взял манишки; /bibs history — за всё время\n"
         "/bibs reset — обновить список манишек (манишки вернули)\n"
         "/bibs add Имя1, Имя2 — внести в список манишек вручную (например, уже существующий список)\n"
         "/bibs remove @username|Имя|№ — убрать человека из списка манишек\n"
@@ -1158,7 +1211,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         full_name(update.effective_user),
         admin,
         format_game(chat_state),
-        format_bibs(chat_state),
+        format_bibs(chat_state) + "\n\n" + format_bibs_history(chat_state),
         date_table(),
         history,
     )
@@ -1188,6 +1241,17 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     args = intent.get("args") or {}
     if not action:
         return
+    chat_state = chat_state_for(update)
+    # Read-only actions are open to everyone.
+    if action == "bibs":
+        await update.message.reply_text(format_bibs(chat_state))
+        return
+    if action == "bibs_history":
+        await update.message.reply_text(format_bibs_history(chat_state))
+        return
+    if action == "list":
+        await list_cmd(update, context)
+        return
     if not await is_admin(update, context):
         await update.message.reply_text("Это может сделать только админ чата.")
         return
@@ -1201,8 +1265,6 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
         await open_cmd(update, context)
     elif action == "close":
         await close_cmd(update, context)
-    elif action == "list":
-        await list_cmd(update, context)
     elif action == "setlimit":
         context.args = [arg("limit")]
         await setlimit_cmd(update, context)
@@ -1226,7 +1288,7 @@ async def ai_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE, in
     elif action == "bibs_add":
         names = args.get("names")
         raw = ", ".join(str(n) for n in names) if isinstance(names, list) else arg("names")
-        await bibs_add_names(update, context, chat_state_for(update), raw)
+        await bibs_add_names(update, context, chat_state, raw)
     elif action == "bibs_remove":
         context.args = ["remove", arg("name")]
         await bibs_cmd(update, context)
@@ -1467,6 +1529,10 @@ async def bibs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         start_bibs_round(chat_state, "")
         save_state()
         await post_bibs_message(context, update.effective_chat.id, chat_state)
+        return
+
+    if sub in ("history", "all", "история", "всего", "все", "всё"):
+        await update.message.reply_text(format_bibs_history(chat_state))
         return
 
     if sub in ("add", "добавить", "+"):
